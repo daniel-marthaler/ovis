@@ -54,6 +54,45 @@ function processTree(rootPid: number): number[] {
   return tree;
 }
 
+/** The session ids a pid owns, from the CLI's own lock files (written with a live heartbeat). */
+export function kimiSessionIdsByPid(home = homedir()): Map<number, string> {
+  const map = new Map<number, string>();
+  let names: string[];
+  try { names = readdirSync(join(home, ".kimi-code", "locks", "sessions")); } catch { return map; }
+  for (const name of names) {
+    if (!name.endsWith(".lock")) continue;
+    try {
+      const lock = JSON.parse(readFileSync(join(home, ".kimi-code", "locks", "sessions", name), "utf8")) as { pid?: unknown };
+      if (Number.isSafeInteger(lock.pid) && (lock.pid as number) > 1) map.set(lock.pid as number, name.slice(0, -".lock".length));
+    } catch { /* a lock half-written: the next read has it whole */ }
+  }
+  return map;
+}
+
+/** The main agent's wire log of the session with this id, via the index, else by scanning the stores. */
+export function kimiWireForSessionId(sessionId: string, home = homedir()): string | null {
+  try {
+    const index = readFileSync(join(home, ".kimi-code", "session_index.jsonl"), "utf8");
+    for (const line of index.split("\n")) {
+      if (line.length === 0) continue;
+      try {
+        const entry = JSON.parse(line) as { sessionId?: unknown; sessionDir?: unknown };
+        if (entry.sessionId === sessionId && typeof entry.sessionDir === "string" && entry.sessionDir.length > 0) {
+          return join(entry.sessionDir, "agents", "main", "wire.jsonl");
+        }
+      } catch { /* skip a broken line */ }
+    }
+  } catch { /* no index */ }
+  let stores: string[];
+  try { stores = readdirSync(join(home, ".kimi-code", "sessions")); } catch { return null; }
+  for (const store of stores) {
+    if (!store.startsWith("wd_")) continue;
+    const path = join(home, ".kimi-code", "sessions", store, sessionId, "agents", "main", "wire.jsonl");
+    try { statSync(path); return path; } catch { /* not in this store */ }
+  }
+  return null;
+}
+
 /** The one wire log held open by the pane's process tree, or null when the evidence is not unique. */
 export async function kimiPathFromProcessTree(paneId: string): Promise<string | null> {
   if (process.platform !== "linux") return null;
@@ -109,34 +148,95 @@ export function kimiTranscriptPath(cwd: string, home = homedir(), startedAtMs: n
 }
 
 /** The shell's start time as the /proc entry's ctime, null when unavailable. */
-function shellStartedAtMs(shellPid: number): number | null {
-  try { return statSync(`/proc/${shellPid}`).ctimeMs; } catch { return null; }
+function processStartedAtMs(pid: number): number | null {
+  try { return statSync(`/proc/${pid}`).ctimeMs; } catch { return null; }
 }
 
-const paneResolution = new Map<string, { path: string; at: number }>();
+/**
+ * The session created closest before `startedAtMs` (a pane's process starts just before its CLI
+ * writes the session's metadata), when that lead is small; null otherwise — a session far older
+ * than the process is a resumed one, and time says nothing about which pane resumed it.
+ */
+export function kimiTranscriptPathNearStart(cwd: string, startedAtMs: number, home = homedir()): string | null {
+  if (typeof cwd !== "string" || cwd.length === 0) return null;
+  const root = kimiSessionsDir(cwd, home);
+  let names: string[];
+  try { names = readdirSync(root); } catch { return null; }
+  let best: { path: string; lead: number } | null = null;
+  for (const name of names) {
+    if (!name.startsWith("session_")) continue;
+    const path = join(root, name, "agents", "main", "wire.jsonl");
+    try { statSync(path); } catch { continue; }
+    const createdAt = kimiWireCreatedAt(path);
+    if (createdAt === null) continue;
+    const lead = startedAtMs - createdAt;
+    if (lead < -5_000 || lead > 120_000) continue;
+    if (best === null || lead < best.lead) best = { path, lead };
+  }
+  return best?.path ?? null;
+}
+
+const paneResolution = new Map<string, { path: string; at: number; pinned: boolean }>();
 const RESOLVE_TTL_MS = 15_000;
+const PIN_VERIFY_MS = 30_000;
 
 /**
- * The wire log for the pane: the one its process tree holds open, else the session matching the
- * pane's start time in the pane's cwd (foreground cwd as fallback). Answers are cached briefly —
- * a new session in the same pane (a /clear) is picked up within the TTL.
+ * The wire log for the pane, in order of evidence:
+ *
+ * 1. A file-descriptor match in the pane's process tree. The CLI appends and closes, so the log
+ *    is open only in write bursts; the first match therefore pins the pane's session until a
+ *    different match replaces it (a /clear in the pane).
+ * 2. A session created just before the pane's foreground process started — a new CLI makes its
+ *    session within seconds of its own start (this is what separates two panes in one cwd).
+ * 3. The newest session started at or before the foreground process, then the shell.
+ *
+ * Answers are cached briefly; unpinned entries follow the TTL, a pin is re-verified on its own
+ * interval and kept when no fresh fd evidence says otherwise.
  */
 export async function kimiTranscriptPathForPane(pane: HerdrPane, cwd: string, home = homedir()): Promise<string | null> {
+  const now = Date.now();
   const cached = paneResolution.get(pane.pane_id);
-  if (cached !== undefined && Date.now() - cached.at < RESOLVE_TTL_MS) return cached.path;
+  if (cached !== undefined && (cached.pinned ? now - cached.at < PIN_VERIFY_MS : now - cached.at < RESOLVE_TTL_MS)) return cached.path;
   let path: string | null = null;
+  let pinned = false;
   try { path = await kimiPathFromProcessTree(pane.pane_id); } catch { path = null; }
-  if (path === null) {
+  if (path !== null) {
+    pinned = true;
+  } else {
+    // the CLI's lock files name the owner pid of each live session: the strongest steady evidence
     const info = await paneProcessInfo(pane.pane_id).catch(() => null);
-    const shell = info?.shell_pid;
-    const startedAtMs = typeof shell === "number" && Number.isSafeInteger(shell) && shell > 1 ? shellStartedAtMs(shell) : null;
-    const cwds = [cwd, typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? pane.foreground_cwd : ""];
-    for (const candidate of cwds) {
-      path = kimiTranscriptPath(candidate, home, startedAtMs);
-      if (path !== null) break;
+    const locks = kimiSessionIdsByPid(home);
+    if (locks.size > 0) {
+      const shellPid = typeof info?.shell_pid === "number" && Number.isSafeInteger(info.shell_pid) && info.shell_pid > 1 ? info.shell_pid : null;
+      const candidates = [...new Set([
+        ...(shellPid !== null ? [shellPid] : []),
+        ...(info?.foreground_processes ?? []).map((process) => process.pid),
+        ...(shellPid !== null ? processTree(shellPid) : []),
+      ])].filter((pid): pid is number => typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1);
+      for (const pid of candidates) {
+        const sessionId = locks.get(pid);
+        if (sessionId === undefined) continue;
+        path = kimiWireForSessionId(sessionId, home);
+        if (path !== null) break;
+      }
+    }
+    const foreground = (info?.foreground_processes ?? [])[0];
+    const fgStart = foreground !== undefined && Number.isSafeInteger(foreground.pid) && foreground.pid > 1 ? processStartedAtMs(foreground.pid) : null;
+    if (path === null && fgStart !== null) {
+      path = kimiTranscriptPathNearStart(cwd, fgStart, home)
+        ?? (typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? kimiTranscriptPathNearStart(pane.foreground_cwd, fgStart, home) : null);
+    }
+    if (path === null) {
+      const shell = info?.shell_pid;
+      const startedAtMs = typeof shell === "number" && Number.isSafeInteger(shell) && shell > 1 ? processStartedAtMs(shell) : null;
+      const cwds = [cwd, typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? pane.foreground_cwd : ""];
+      for (const candidate of cwds) {
+        path = kimiTranscriptPath(candidate, home, startedAtMs);
+        if (path !== null) break;
+      }
     }
   }
-  paneResolution.set(pane.pane_id, { path: path ?? "", at: Date.now() });
+  paneResolution.set(pane.pane_id, { path: path ?? "", at: now, pinned });
   return path;
 }
 

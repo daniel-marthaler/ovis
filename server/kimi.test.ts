@@ -2,7 +2,7 @@ import { expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { kimiSessionsDir, kimiTranscriptPath, kimiUserText, parseKimiTranscript } from "./kimi.ts";
+import { kimiSessionsDir, kimiTranscriptPath, kimiTranscriptPathNearStart, kimiUserText, parseKimiTranscript } from "./kimi.ts";
 import { turnStarts } from "./transcript-turns.ts";
 
 it("derives the session directory the way Kimi Code does", () => {
@@ -29,6 +29,20 @@ it("with a pane start time, picks the newest session started at or before it", (
     expect(kimiTranscriptPath("/home/mad", home, Date.parse("2026-11-03T12:00:00Z"))).toBe(newer);
     // without a start time the newest mtime stands in
     expect(kimiTranscriptPath("/home/mad", home)).toBe(newer);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+it("near-start picks the session a process created seconds before it started", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-near-")));
+  try {
+    const resumed = fakeSession(home, "/home/mad", "session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", new Date("2026-11-01T10:00:00Z"), Date.parse("2026-10-30T08:00:00Z"));
+    const own = fakeSession(home, "/home/mad", "session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", new Date("2026-11-01T12:00:00Z"), Date.parse("2026-11-01T09:58:40Z"));
+    const start = Date.parse("2026-11-01T09:59:00Z");
+    // the session made 20 s before the process started wins over the older resumed one
+    expect(kimiTranscriptPathNearStart("/home/mad", start, home)).toBe(own);
+    expect(kimiTranscriptPathNearStart("/home/mad", start, home)).not.toBe(resumed);
+    // a process far younger than every session names none: resumption says nothing by time
+    expect(kimiTranscriptPathNearStart("/home/mad", Date.parse("2026-11-02T09:59:00Z"), home)).toBeNull();
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -108,4 +122,24 @@ it("marks user prompts as turn starts for the transcript scanner", () => {
   expect(starts).toHaveLength(2);
   expect(bytes.subarray(starts[0]!).toString("utf8")).toContain("Sag Hallo");
   expect(bytes.subarray(starts[1]!).toString("utf8")).toContain("Und Tschau");
+});
+
+it("lock files map a pid to its own session, the index maps it to the wire log", async () => {
+  const { kimiSessionIdsByPid, kimiWireForSessionId } = await import("./kimi.ts");
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-locks-")));
+  try {
+    const wire = fakeSession(home, "/home/mad", "session_cccccccc-cccc-cccc-cccc-cccccccccccc", new Date("2026-11-01T10:00:00Z"), Date.parse("2026-11-01T09:00:00Z"));
+    const locksDir = join(home, ".kimi-code", "locks", "sessions");
+    mkdirSync(locksDir, { recursive: true });
+    writeFileSync(join(locksDir, "session_cccccccc-cccc-cccc-cccc-cccccccccccc.lock"), JSON.stringify({ version: 1, pid: 4242 }));
+    const byPid = kimiSessionIdsByPid(home);
+    expect(byPid.get(4242)).toBe("session_cccccccc-cccc-cccc-cccc-cccccccccccc");
+    expect(byPid.get(9999)).toBeUndefined();
+    // via the index
+    writeFileSync(join(home, ".kimi-code", "session_index.jsonl"), `${JSON.stringify({ sessionId: "session_cccccccc-cccc-cccc-cccc-cccccccccccc", sessionDir: join(home, ".kimi-code", "sessions", "wd_mad_6c73d0ee67aa", "session_cccccccc-cccc-cccc-cccc-cccccccccccc"), workDir: "/home/mad" })}\n`);
+    expect(kimiWireForSessionId("session_cccccccc-cccc-cccc-cccc-cccccccccccc", home)).toBe(wire);
+    // without the index, the store scan finds it
+    rmSync(join(home, ".kimi-code", "session_index.jsonl"));
+    expect(kimiWireForSessionId("session_cccccccc-cccc-cccc-cccc-cccccccccccc", home)).toBe(wire);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
