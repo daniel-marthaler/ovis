@@ -120,14 +120,19 @@ const TURN_MARK: Record<StreamSource, Buffer> = {
  * and the same for pi, whose prompts are `message` records with a user role.
  */
 function opensTurn(source: StreamSource, line: string, blobs: string | null): boolean | "inline" {
-  let entry: { type?: unknown; uuid?: unknown; origin?: unknown; permissionMode?: unknown; data?: { content?: unknown }; isMeta?: unknown; isCompactSummary?: unknown; payload?: { type?: unknown }; message?: { role?: unknown; content?: unknown } };
+  let entry: { type?: unknown; uuid?: unknown; origin?: unknown; permissionMode?: unknown; data?: { content?: unknown }; isMeta?: unknown; isCompactSummary?: unknown; payload?: { type?: unknown }; message?: { role?: unknown; content?: unknown; origin?: { kind?: unknown } } };
   try { entry = JSON.parse(line); } catch { return false; }
   if (entry === null || typeof entry !== "object") return false;
   if (source === "copilot-transcript") return entry.type === "user.message" && copilotRootRecord(entry) && copilotPromptOpens(entry.data);
   if (source === "codex-transcript") return entry.type === "event_msg" && entry.payload?.type === "task_started";
   if (source === "muse-transcript") return musePrompt(entry as Record<string, unknown>) !== null;
   if (source === "letta-transcript") return lettaPrompt(entry as Record<string, unknown>) !== null;
-  if (source === "kimi-transcript") return entry.type === "context.append_message" && entry.message?.role === "user" && kimiUserText(entry.message.content) !== null;
+  if (source === "kimi-transcript") {
+    if (entry.type !== "context.append_message" || entry.message?.role !== "user" || kimiUserText(entry.message.content) === null) return false;
+    // Meta traffic (injections, task notifications, cron firings) opens no turn, just like parseKimiTranscript drops it.
+    const originKind = entry.message.origin?.kind;
+    return typeof originKind !== "string" || originKind === "user";
+  }
   if (source !== "claude-transcript") {
     const message = piMessage(entry);
     if (message?.role !== "user") return false;

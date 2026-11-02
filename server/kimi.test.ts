@@ -116,6 +116,24 @@ it("skips broken lines without losing the turn structure", () => {
   expect(turns[0]!.parts).toEqual([{ kind: "text", text: "hi" }]);
 });
 
+it("drops meta traffic: only the user's own input becomes a turn", () => {
+  const wire = [
+    { type: "context.append_message", message: { role: "user", origin: { kind: "injection", variant: "system_reminder" }, content: [{ type: "text", text: "<system-reminder>The date has changed</system-reminder>" }] } },
+    { type: "context.append_message", message: { role: "user", origin: { kind: "injection", variant: "agents_md" }, content: [{ type: "text", text: "# AGENTS.md" }] } },
+    { type: "context.append_message", message: { role: "user", origin: { kind: "task", taskId: "bash-1", status: "completed" }, content: [{ type: "text", text: "<notification id=\"task:bash-1:completed\">" }] } },
+    { type: "context.append_message", message: { role: "user", origin: { kind: "cron_job", jobId: "j1" }, content: [{ type: "text", text: "<cron-fire jobId=\"j1\">" }] } },
+    { type: "context.append_message", message: { role: "user", origin: { kind: "skill_activation" }, content: [{ type: "text", text: "skill" }] } },
+    { type: "context.append_message", message: { role: "user", origin: { kind: "user" }, content: [{ type: "text", text: "Echte Frage" }] } },
+    { type: "context.append_loop_event", agentId: "main", event: { type: "content.part", part: { type: "text", text: "Antwort" } }, time: 1793439036000 },
+  ].map((record) => JSON.stringify(record)).join("\n");
+  const turns = parseKimiTranscript(wire);
+  expect(turns).toHaveLength(2);
+  expect(turns[0]).toEqual({ role: "user", ts: null, parts: [{ kind: "text", text: "Echte Frage" }] });
+  expect(turns[1]!.role).toBe("assistant");
+  // The meta lines open no turn start either, for the incremental scanner.
+  expect(turnStarts(Buffer.from(wire), "kimi-transcript")).toHaveLength(1);
+});
+
 it("marks user prompts as turn starts for the transcript scanner", () => {
   const bytes = Buffer.from(WIRE);
   const starts = turnStarts(bytes, "kimi-transcript");

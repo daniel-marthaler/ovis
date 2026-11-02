@@ -263,7 +263,9 @@ type PendingTool = Extract<ConversationPart, { kind: "tool" }> & { state: "pendi
  * wire.jsonl records, one per line: user prompts are `context.append_message`
  * records; the answer loop is `context.append_loop_event` records — `content.part`
  * (text or think), `tool.call` and its later `tool.result`, all carrying the loop's
- * `time`. Everything between two user prompts is one assistant turn.
+ * `time`. Everything between two user prompts is one assistant turn. A stored user
+ * message whose `origin.kind` is not "user" (injections, task notifications, cron
+ * firings) is meta traffic and never becomes a turn.
  */
 export function parseKimiTranscript(text: string): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
@@ -282,7 +284,7 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
     if (line.length === 0) continue;
     let record: {
       type?: unknown; time?: unknown;
-      message?: { role?: unknown; content?: unknown };
+      message?: { role?: unknown; content?: unknown; origin?: { kind?: unknown } };
       event?: {
         type?: unknown; part?: { type?: unknown; text?: unknown; think?: unknown };
         toolCallId?: unknown; name?: unknown; args?: unknown; display?: { kind?: unknown; command?: unknown };
@@ -293,6 +295,12 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
     const ts = typeof record.time === "number" ? new Date(record.time).toISOString() : null;
     if (record.type === "context.append_message") {
       if (record.message?.role !== "user") continue;
+      // The CLI tags every stored message with its origin: only the user's own
+      // input belongs in the chat. Injections (AGENTS.md, system reminders),
+      // task notifications and cron firings stay invisible, like other agents'
+      // meta entries; records from older CLIs without an origin still pass.
+      const originKind = record.message.origin?.kind;
+      if (typeof originKind === "string" && originKind !== "user") continue;
       flush();
       const body = kimiUserText(record.message.content);
       turns.push({ role: "user", ts, parts: body === null ? [] : [{ kind: "text", text: body }] });
