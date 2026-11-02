@@ -64,6 +64,7 @@ import { museSession, museToolOutput, MuseUnavailable, parseMuseTranscript } fro
 import { resolveMuseSession } from "./muse-store.ts";
 import { LettaUnavailable, lettaToolOutput, parseLettaTranscript } from "./letta.ts";
 import { lettaLocalSettings, resolveLettaTranscript } from "./letta-store.ts";
+import { kimiTranscriptPath, parseKimiTranscript } from "./kimi.ts";
 import { withinRetentionBudget } from "./retention-budget.ts";
 import { forgetAllPiIndexes, forgetPiIndex, piAbandonedTurns, piBranchRecords, piBranchSegments } from "./pi-tree.ts";
 import { COPILOT_IMAGE_REF, copilotImage, copilotOffsetOutput, copilotOutput, copilotRootRecord, parseCopilotTranscript } from "./copilot.ts";
@@ -702,6 +703,7 @@ function parseTurns(source: RecognizedConversation["source"], path: string, text
     }
   }
   if (source === "agy-transcript") return parseAgyTranscript(text, path);
+  if (source === "kimi-transcript") return parseKimiTranscript(text);
   if (source === "muse-transcript") {
     try { return parseMuseTranscript(text, museSession(path)); } catch (error) {
       if (error instanceof MuseUnavailable) throw new ConversationUnavailable("transcript_missing");
@@ -1554,6 +1556,12 @@ async function resolveTranscript(pane: HerdrPane, cwd: string, codexHome?: strin
       const resolved = await hermesTranscriptForPane(pane, cwd, hermesHome);
       return { source: "hermes-transcript", path: resolved.dbPath, sessionId: resolved.sessionId };
     }
+    // Kimi Code's store derives from the process's own cwd more often than the pane's shell directory.
+    if (agent === "kimi" || agent === "kimi-code") {
+      const path = kimiTranscriptPath(cwd) ?? (typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? kimiTranscriptPath(pane.foreground_cwd) : null);
+      if (path === null) throw new ConversationUnavailable("no_session_path");
+      return { source: "kimi-transcript", path };
+    }
     throw new ConversationUnavailable("no_recognized_transcript");
   } catch (error) {
     if (error instanceof AgyUnavailable) throw new ConversationUnavailable("transcript_missing");
@@ -1755,7 +1763,7 @@ export async function paneConversation(paneId: string, codexHome?: string, page:
       throw error;
     }
   }
-  const identity = resolved.source === "agy-transcript" || resolved.source === "copilot-transcript" || resolved.source === "letta-transcript" ? resolved.path
+  const identity = resolved.source === "agy-transcript" || resolved.source === "copilot-transcript" || resolved.source === "letta-transcript" || resolved.source === "kimi-transcript" ? resolved.path
     : resolved.source === "claude-transcript" ? nodePath.basename(resolved.path, ".jsonl")
     : resolved.source === "pi-transcript" || resolved.source === "cmd-transcript" || resolved.source === "omp-transcript" ? realpathSync(resolved.path) : null;
   rememberPaneRead(paneId, resolved.path);
