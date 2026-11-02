@@ -10,13 +10,27 @@ it("derives the session directory the way Kimi Code does", () => {
     "/home/mad/fake-home/.kimi-code/sessions/wd_mad_6c73d0ee67aa");
 });
 
-function fakeSession(home: string, cwd: string, session: string, mtime: Date): string {
+function fakeSession(home: string, cwd: string, session: string, mtime: Date, createdAt?: number): string {
   const path = join(kimiSessionsDir(cwd, home), session, "agents", "main", "wire.jsonl");
   mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, "");
+  writeFileSync(path, createdAt !== undefined ? `${JSON.stringify({ type: "metadata", created_at: createdAt })}\n` : "");
   utimesSync(path, mtime, mtime);
   return path;
 }
+
+it("with a pane start time, picks the newest session started at or before it", () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-store-")));
+  try {
+    const older = fakeSession(home, "/home/mad", "session_11111111-1111-1111-1111-111111111111", new Date("2026-11-01T10:00:00Z"), Date.parse("2026-11-01T09:00:00Z"));
+    const newer = fakeSession(home, "/home/mad", "session_22222222-2222-2222-2222-222222222222", new Date("2026-11-02T10:00:00Z"), Date.parse("2026-11-02T09:00:00Z"));
+    // a pane up since Nov 1 noon can only have started the older session
+    expect(kimiTranscriptPath("/home/mad", home, Date.parse("2026-11-01T12:00:00Z"))).toBe(older);
+    // a pane that started later may have started either; the newer one wins
+    expect(kimiTranscriptPath("/home/mad", home, Date.parse("2026-11-03T12:00:00Z"))).toBe(newer);
+    // without a start time the newest mtime stands in
+    expect(kimiTranscriptPath("/home/mad", home)).toBe(newer);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 
 it("returns null without a store and the newest session when there are several", () => {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-store-")));

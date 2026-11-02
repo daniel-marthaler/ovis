@@ -64,7 +64,7 @@ import { museSession, museToolOutput, MuseUnavailable, parseMuseTranscript } fro
 import { resolveMuseSession } from "./muse-store.ts";
 import { LettaUnavailable, lettaToolOutput, parseLettaTranscript } from "./letta.ts";
 import { lettaLocalSettings, resolveLettaTranscript } from "./letta-store.ts";
-import { kimiTranscriptPath, parseKimiTranscript } from "./kimi.ts";
+import { kimiTranscriptPathForPane, parseKimiTranscript } from "./kimi.ts";
 import { withinRetentionBudget } from "./retention-budget.ts";
 import { forgetAllPiIndexes, forgetPiIndex, piAbandonedTurns, piBranchRecords, piBranchSegments } from "./pi-tree.ts";
 import { COPILOT_IMAGE_REF, copilotImage, copilotOffsetOutput, copilotOutput, copilotRootRecord, parseCopilotTranscript } from "./copilot.ts";
@@ -1558,7 +1558,7 @@ async function resolveTranscript(pane: HerdrPane, cwd: string, codexHome?: strin
     }
     // Kimi Code's store derives from the process's own cwd more often than the pane's shell directory.
     if (agent === "kimi" || agent === "kimi-code") {
-      const path = kimiTranscriptPath(cwd) ?? (typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? kimiTranscriptPath(pane.foreground_cwd) : null);
+      const path = await kimiTranscriptPathForPane(pane, cwd);
       if (path === null) throw new ConversationUnavailable("no_session_path");
       return { source: "kimi-transcript", path };
     }

@@ -1,13 +1,15 @@
 /**
  * Kimi Code keeps one append-only wire log per agent session:
- * `~/.kimi-code/sessions/wd_<dir-name>_<sha256(cwd)[:12]>/session_<id>/agents/<agent>/wire.jsonl`.
+ * `~/.kimi-code/sessions/wd_<dir-name>_<sha256(cwd)[:12]>/<session>/agents/<agent>/wire.jsonl`.
  * This file reads that log into conversation turns for the chat view.
  */
 import { createHash } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
+import { opendirSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ConversationPart, ConversationTurn } from "../shared/protocol.ts";
+import type { HerdrPane } from "../shared/protocol.ts";
+import { paneProcessInfo } from "./herdr/client.ts";
 
 /** The store directory Kimi Code derives from a working directory. */
 export function kimiSessionsDir(cwd: string, home = homedir()): string {
@@ -15,28 +17,127 @@ export function kimiSessionsDir(cwd: string, home = homedir()): string {
   return join(home, ".kimi-code", "sessions", `wd_${basename(cwd)}_${key}`);
 }
 
+/** Every wire log path a pid holds open, resolved to its real path; empty on any read failure. */
+function wireLogsHeld(pid: number): string[] {
+  if (process.platform !== "linux") return [];
+  let dir: ReturnType<typeof opendirSync>;
+  try { dir = opendirSync(`/proc/${pid}/fd`); } catch { return []; }
+  const held: string[] = [];
+  try {
+    let count = 0;
+    for (let entry = dir.readSync(); entry; entry = dir.readSync()) {
+      if (++count > 4096) return [];
+      let link: string;
+      try { link = readlinkSync(`/proc/${pid}/fd/${entry.name}`); } catch { continue; }
+      if (!link.includes("/.kimi-code/sessions/") || !link.endsWith("/wire.jsonl")) continue;
+      try { held.push(realpathSync(link)); } catch { /* gone between readlink and realpath */ }
+    }
+  } finally { dir.closeSync(); }
+  return held;
+}
+
+/** shell pid and every descendant of it, from /proc; the pane's agent process is one of them. */
+function processTree(rootPid: number): number[] {
+  const children = new Map<number, number[]>();
+  let entries: string[];
+  try { entries = readdirSync("/proc").filter((name) => /^\d+$/.test(name)); } catch { return [rootPid]; }
+  for (const entry of entries) {
+    let stat: string;
+    try { stat = readFileSync(`/proc/${entry}/stat`, "utf8"); } catch { continue; }
+    const fields = stat.split(") ").pop()!.split(" ");
+    const ppid = Number(fields[1]);
+    if (!Number.isSafeInteger(ppid)) continue;
+    children.set(ppid, [...(children.get(ppid) ?? []), Number(entry)]);
+  }
+  const tree = [rootPid];
+  for (let at = 0; at < tree.length && at < 64; at += 1) tree.push(...(children.get(tree[at]!) ?? []));
+  return tree;
+}
+
+/** The one wire log held open by the pane's process tree, or null when the evidence is not unique. */
+export async function kimiPathFromProcessTree(paneId: string): Promise<string | null> {
+  if (process.platform !== "linux") return null;
+  const info = await paneProcessInfo(paneId).catch(() => null);
+  const shell = info?.shell_pid;
+  if (typeof shell !== "number" || !Number.isSafeInteger(shell) || shell <= 1) return null;
+  const held = new Set<string>();
+  for (const pid of processTree(shell)) for (const path of wireLogsHeld(pid)) held.add(path);
+  return held.size === 1 ? [...held][0]! : null;
+}
+
+/** The session's own creation time from its metadata record (first line), null when unreadable. */
+function kimiWireCreatedAt(path: string): number | null {
+  let head: string;
+  try { head = readFileSync(path, "utf8").slice(0, 65536); } catch { return null; }
+  const newline = head.indexOf("\n");
+  if (newline === -1) return null;
+  try {
+    const record = JSON.parse(head.slice(0, newline)) as { type?: unknown; created_at?: unknown };
+    return record.type === "metadata" && typeof record.created_at === "number" ? record.created_at : null;
+  } catch { return null; }
+}
+
 /**
- * The wire log of the newest session started in `cwd`, null when Kimi Code never
- * wrote one there. A pane's process does not hold the log open (the CLI appends
- * and closes), so the newest file by mtime is the live session; the others are
- * sessions that ended. When two panes share one cwd they read the same newest
- * session until the second one writes — a known ambiguity of a store that keeps
- * no process binding.
+ * The session a pane started in `cwd`, or null when Kimi Code never wrote one there.
+ * With `startedAtMs` (the pane shell's start), the newest session created at or before it wins —
+ * a pane keeps its own session even after another pane in the same cwd wrote a newer one. Without
+ * it, the newest mtime stands in. The CLI appends and closes, so the frontend process holds no
+ * open file to follow on platforms without /proc.
  */
-export function kimiTranscriptPath(cwd: string, home = homedir()): string | null {
+export function kimiTranscriptPath(cwd: string, home = homedir(), startedAtMs: number | null = null): string | null {
   if (typeof cwd !== "string" || cwd.length === 0) return null;
+  const root = kimiSessionsDir(cwd, home);
   let names: string[];
-  try { names = readdirSync(kimiSessionsDir(cwd, home)); } catch { return null; }
-  let best: { path: string; mtimeMs: number } | null = null;
+  try { names = readdirSync(root); } catch { return null; }
+  let best: { path: string; rank: number } | null = null;
   for (const name of names) {
     if (!name.startsWith("session_")) continue;
-    const path = join(kimiSessionsDir(cwd, home), name, "agents", "main", "wire.jsonl");
+    const path = join(root, name, "agents", "main", "wire.jsonl");
+    let rank: number;
     try {
-      const mtimeMs = statSync(path).mtimeMs;
-      if (best === null || mtimeMs > best.mtimeMs) best = { path, mtimeMs };
-    } catch { /* a session dir without the main agent's log */ }
+      rank = statSync(path).mtimeMs;
+    } catch { continue; /* a session dir without the main agent's log */ }
+    if (startedAtMs !== null) {
+      const createdAt = kimiWireCreatedAt(path);
+      // only sessions the pane could have started; newer ones belong to a later pane
+      if (createdAt === null || createdAt > startedAtMs + 10_000) continue;
+      rank = createdAt;
+    }
+    if (best === null || rank > best.rank) best = { path, rank };
   }
   return best?.path ?? null;
+}
+
+/** The shell's start time as the /proc entry's ctime, null when unavailable. */
+function shellStartedAtMs(shellPid: number): number | null {
+  try { return statSync(`/proc/${shellPid}`).ctimeMs; } catch { return null; }
+}
+
+const paneResolution = new Map<string, { path: string; at: number }>();
+const RESOLVE_TTL_MS = 15_000;
+
+/**
+ * The wire log for the pane: the one its process tree holds open, else the session matching the
+ * pane's start time in the pane's cwd (foreground cwd as fallback). Answers are cached briefly —
+ * a new session in the same pane (a /clear) is picked up within the TTL.
+ */
+export async function kimiTranscriptPathForPane(pane: HerdrPane, cwd: string, home = homedir()): Promise<string | null> {
+  const cached = paneResolution.get(pane.pane_id);
+  if (cached !== undefined && Date.now() - cached.at < RESOLVE_TTL_MS) return cached.path;
+  let path: string | null = null;
+  try { path = await kimiPathFromProcessTree(pane.pane_id); } catch { path = null; }
+  if (path === null) {
+    const info = await paneProcessInfo(pane.pane_id).catch(() => null);
+    const shell = info?.shell_pid;
+    const startedAtMs = typeof shell === "number" && Number.isSafeInteger(shell) && shell > 1 ? shellStartedAtMs(shell) : null;
+    const cwds = [cwd, typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? pane.foreground_cwd : ""];
+    for (const candidate of cwds) {
+      path = kimiTranscriptPath(candidate, home, startedAtMs);
+      if (path !== null) break;
+    }
+  }
+  paneResolution.set(pane.pane_id, { path: path ?? "", at: Date.now() });
+  return path;
 }
 
 /** The text of a user message: Kimi stores content as parts, older ones as a plain string. */
