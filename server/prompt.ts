@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { HerdrPane, InteractivePrompt, PanePromptResponse, PromptAnswer, SessionSnapshot, SlashCommand } from "../shared/protocol.ts";
 import { builtinCommands, cachedPaneCommands } from "./commands.ts";
+import { piRecordText } from "./pi-delivery.ts";
 import { agentProcesses, ompTranscriptPath, paneRunsOmo, readCommandTranscript } from "./conversation.ts";
 import { ConversationNotStarted } from "./conversation-shared.ts";
 import { agentProcessInFront } from "./agent-process.ts";
@@ -9,7 +10,7 @@ import { processAlive, processStartedAt, processStartUpperBoundAsync } from "./p
 import { commandInvocations, commandOutcome, CommandReservations, dialogSettlingScreen, ownsCommandDialog, WINDOW_MS as COMMAND_WINDOW_MS, type CommandSend } from "./outcome.ts";
 import { codexTranscriptPath, paneCodexHome, unansweredCodexQuestions } from "./codex.ts";
 import { HerdrError, paneProcessInfo, paneRead, paneScrollInfo, paneSendKeys, paneSendText, type ProcessInfo } from "./herdr/client.ts";
-import { piTranscriptPath } from "./pi.ts";
+import { isPiProcess, piTranscriptPath } from "./pi.ts";
 import { heldOmoProcess } from "./omo.ts";
 import { OmoAskReader, ompAsksAfter, type OmoAsks } from "./omo-ask.ts";
 import { ompCallPrompt, ompMarkdownPrompt, ompOpenCall, ompStepPrompt } from "./omp-ask.ts";
@@ -209,6 +210,41 @@ export function prepareCommandSend(pane: HerdrPane, text: string, screen = ""): 
   const agent = cached?.agent ?? resolveAgent(pane).agent;
   if (!agent) return undefined;
   return commandSendFrom(pane, agent, cached?.commands ?? builtinCommands(agent), text, screen);
+}
+
+/**
+ * Whether Pi runs `text` as something it keeps no record of as sent, read as Pi's submit handler reads
+ * the trimmed text: a builtin such as `/model` runs without a user record, and `!command` is recorded
+ * as the shell's output. So no record can ever confirm a Chat receipt for it. A builtin's name with an
+ * argument it does not take (`/new please`) and a lone `!` are messages Pi records as typed, matched
+ * as Pi matches them (case and all). Any other `/name` keeps its receipt: whether it is a prompt
+ * template or an extension's command depends on what that Pi loaded, which no catalog proves, and
+ * pi-delivery.ts settles it on the first record Pi writes after it. A skill is read back from its record.
+ */
+export function piRunsCommand(pane: HerdrPane, text: string): boolean {
+  const typed = piRecordText(text);
+  if (typed.startsWith("!")) return (typed.startsWith("!!") ? typed.slice(2) : typed.slice(1)).trim().length > 0;
+  // a builtin is matched whole or before a space
+  const name = /^\/(\S+)(?:\s|$)/u.exec(typed)?.[1];
+  if (!name) return false;
+  const cached = cachedPaneCommands(pane);
+  const commands = cached?.agent === "pi" ? cached.commands : builtinCommands("pi");
+  return commands.some((row) => {
+    if (row.trigger !== undefined || row.source !== "builtin" || row.name !== name) return false;
+    if (typed === `/${name}`) return true;
+    return typed.startsWith(`/${name} `) && (row.forms ?? []).some((form) => form.match !== "bare");
+  });
+}
+
+/**
+ * Whether the pane's cached catalog lists `text`'s `/name` as a prompt template. A hint only: what that
+ * Pi loaded may differ, so the receipt stays (pi-delivery.ts settles it on the first record after it).
+ */
+export function piListsTemplate(pane: HerdrPane, text: string): boolean {
+  const name = /^\/(\S+)(?:\s|$)/u.exec(piRecordText(text))?.[1];
+  const cached = cachedPaneCommands(pane);
+  return name !== undefined && cached?.agent === "pi" && cached.commands.some((row) =>
+    row.trigger === undefined && row.source !== "builtin" && row.source !== "skill" && row.name === name);
 }
 
 /** The send record for `text` against a given catalog: the remembered one above, or one the delivery already waited for. */
@@ -741,6 +777,24 @@ function untilAborted<T>(look: Promise<T>, signal?: AbortSignal): Promise<T | un
 /** The shell (or anything but omp) took the pane's input under a key-driven omp answer: nothing more is sent. */
 class OmpNotInFront extends KeyRefused {}
 
+/** pi no longer holds the pane's input under a key-driven pi answer: nothing more is sent. */
+class PiNotInFront extends KeyRefused {}
+
+/**
+ * Whether pi itself holds the pane's input, as ompOwnsInput asks for omp: the screen pi leaves behind
+ * when it ends, its last dialog with one line of the shell's under it, reads like a dialog over an
+ * extension's status line (piFooterLines), and a key answered there would go to the shell. herdr
+ * names an omo pane pi too, and omo is pi's own build. Unknown (herdr did not answer) is not pi's.
+ * Windows lists no foreground process group: read as before. A cancelled answer's signal is not
+ * awaited here: its moves end as they did before this look (the answer path decides on cancelling).
+ */
+async function piOwnsInput(paneId: string): Promise<boolean> {
+  if (process.platform === "win32") return true;
+  const info = await paneProcessInfo(paneId).catch(() => null);
+  return (info?.foreground_processes ?? []).some((entry) => isPiProcess(entry.argv ?? [])
+    || agentProcesses([entry], "pi").length > 0 || agentProcesses([entry], "omo").length > 0);
+}
+
 /** A move between a form's questions ran out of its request's time, or its asking ended: no further key. */
 class MoveLapsed extends KeyRefused {}
 
@@ -825,7 +879,8 @@ async function readKnownPrompt(
    * read before and parsed with what this read found; a card the screen no longer draws so authorizes no key
    */
   settle = false,
-): Promise<{ prompt: InteractivePrompt | null; screen?: string; stale?: boolean; inputUnverified?: true; suppressFallback?: true }> {
+): Promise<{ prompt: InteractivePrompt | null; screen?: string; stale?: boolean; inputUnverified?: true; suppressFallback?: true;
+  /** the card as the settling read drew it: the same card, its cursor where the screen has it now */ settled?: InteractivePrompt }> {
   // no native card (no session herdr reports, no verified v2 service, no pending form): OpenCode
   // v1's own question prompt is read off the screen below (dialogs/opencode.ts, #1386)
   native: if (agent === "opencode") {
@@ -1062,6 +1117,11 @@ async function readKnownPrompt(
   if (agent === "omp" && (prompt !== null || pane.agent_status === "blocked") && !(await ompOwnsInput(paneId))) {
     return { prompt: null, screen, suppressFallback: true };
   }
+  // and every card pi's own dialogs and questionnaires draw, which answer by keys (pi-ask's form answers
+  // through the extension and returned above; omo's cards on a pane herdr names pi keep their own checks)
+  if (agent === "pi" && prompt !== null && parsedByPublicPrompt.get(prompt)?.responder?.startsWith("pi-") && !(await piOwnsInput(paneId))) {
+    return { prompt: null, screen, suppressFallback: true };
+  }
   if (prompt && await claudeHeldIsGrey(paneId, prompt)) return { prompt: null, screen };
   // pi-ask's form with no card: pi-ask takes no typed keys (its docs/remote-events.md), so no card
   // that answers by keys is offered, pi's own dialogs included (the answer would refuse them too):
@@ -1079,6 +1139,7 @@ async function readKnownPrompt(
     if (parsedByPublicPrompt.get(fallback)?.responder === "fallback-gjc-menu") return { prompt: fallback, screen };
   }
   const count = agent === "codex" && prompt === null ? queuedQuestionCount(screen) : 0;
+  let settled: InteractivePrompt | undefined;
   if (settle && prompt) {
     // read as the card was read (its colours, or the screen's text), after every await above: parsed with no await
     // between, so the card checked is the one the screen draws right now
@@ -1090,8 +1151,9 @@ async function readKnownPrompt(
     const now = again ? rebind(again) : null;
     const at = (card: InteractivePrompt): number | undefined => card.steps?.findIndex(step => step.current);
     if (!now || now.id !== prompt.id || at(now) !== at(prompt)) inputUnverified = true;
+    else settled = now;
   }
-  if (count === 0 || !pane.cwd) return { prompt, screen, inputUnverified };
+  if (count === 0 || !pane.cwd) return { prompt, screen, inputUnverified, ...(settled ? { settled } : {}) };
   let rollout = queueRollouts.get(paneId);
   if (!rollout || Date.now() - rollout.at > QUEUE_ROLLOUT_MS) {
     rollout = { path: await codexTranscriptPath(paneId, pane.cwd, await paneCodexHome(paneId, codexHome)), at: Date.now() };
@@ -1337,6 +1399,8 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
       const ompCall = agent === "omp" ? parsedPrompt?.ompCall : undefined;
       const guardKey = async (paneId: string, keyAgent: string, signal: AbortSignal): Promise<void> => {
         await keyGuard(paneId, keyAgent, signal);
+        // a key-driven card of pi's own goes to pi only while pi holds the pane (piOwnsInput)
+        if (parsedPrompt?.responder?.startsWith("pi-") && !(await piOwnsInput(paneId))) throw new PiNotInFront();
         if (ompCall !== undefined && !(await ompCallStillOpen(paneId, pane.cwd ?? "", ompCall, signal))) throw new OmpCallChanged();
       };
       /**
@@ -1347,7 +1411,7 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
        * first row), whose read has no card of its own to settle.
        */
       const verifyThenSend = async <T>(look: AbortSignal, guardUntil: number | null, readUntil: number,
-        same: (shown: ParsedPrompt | null, screen: string) => boolean, write: () => T, screenOnly = false): Promise<T> => {
+        same: (shown: ParsedPrompt | null, screen: string, settled: ParsedPrompt | null) => boolean, write: () => T, screenOnly = false): Promise<T> => {
         const guarding = guardKey(body.pane_id, agent, look);
         guarding.catch(() => undefined);
         const guarded = guardUntil === null ? await guarding.then(() => true)
@@ -1359,7 +1423,11 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
         reading.catch(() => undefined);
         const read = await Promise.race([reading, Bun.sleep(Math.max(0, readUntil - Date.now())).then(() => null)]);
         const shown = read?.prompt ? parsedByPublicPrompt.get(read.prompt) ?? null : null;
-        if (!read || read.inputUnverified || Date.now() > readUntil || !same(shown, read.screen ?? "")) throw new KeyRefused();
+        const settled = read?.settled ? parsedByPublicPrompt.get(read.settled) ?? null : null;
+        if (!read || read.inputUnverified || Date.now() > readUntil || !same(shown, read.screen ?? "", settled)) throw new KeyRefused();
+        // pi's select and confirm compare by the dialog drawn, which pi leaves on the screen when it ends, and a
+        // dialog moved off its first row has no card to compare: pi must still hold the pane after this read too
+        if ((parsedPrompt?.responder === "pi-question" || parsedPrompt?.responder === "pi-confirm") && !(await piOwnsInput(body.pane_id))) throw new KeyRefused();
         return write();
       };
       // Next goes on to another question and never answers this one: not with an answer in the same body, and not
@@ -1776,7 +1844,7 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
             const dialog = parsePiDialog(screen, true);
             return dialog?.id === parsed.id && dialog.selectedIndex === cursor && promptTailIsActive(dialog, screen);
           }
-          return shown?.id === parsed.id && shown.selectedIndex === cursor
+          return shown?.id === parsed.id && shown.selectedIndex === cursor && ticked(shown)
             && (responder !== "pi-questionnaire-question" || shown.piQuestionnaireInput === undefined);
         };
         /**
@@ -1802,16 +1870,34 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
             await Bun.sleep(50);
           }
         };
-        /** Whether a read still shows the question this answer is for (its id carries its call and, for questions drawn alike, its tab). */
-        const sameQuestion = (shown: ParsedPrompt | null, screen: string): boolean => {
+        /**
+         * Whether a read still shows the question this answer is for (its id carries its call and, for questions drawn alike, its tab).
+         * `onCursor`: a key that acts on the row under the cursor (Enter, Space), which must still be the row the moves left it
+         * on, in the read and in its settling read (`settled`, the screen as it is right before the key).
+         */
+        const sameQuestion = (shown: ParsedPrompt | null, screen: string, onCursor: boolean, settled: ParsedPrompt | null): boolean => {
           if (interaction) return shown?.responder === responder && interaction.matches(screen);
-          if (responder === "pi-question" || responder === "pi-confirm") return parsePiDialog(screen, true)?.id === parsed.id;
+          if (responder === "pi-question" || responder === "pi-confirm") {
+            const dialog = parsePiDialog(screen, true);
+            return dialog?.id === parsed.id && (!onCursor || dialog.selectedIndex === cursor);
+          }
           // a fallback card is the screen's own (readPrompt draws it when no reader knows the screen): the same card by
           // what it asks and offers, whatever else ticked on the screen since (a spinner, a timer, a token count)
-          if (responder.startsWith("fallback")) return parsedByPublicPrompt.get(parseFallbackPrompt(agent, screen))?.id === parsed.id;
+          if (responder.startsWith("fallback")) {
+            const card = parsedByPublicPrompt.get(parseFallbackPrompt(agent, screen));
+            return card?.id === parsed.id && (!onCursor || card.selectedIndex === cursor);
+          }
           return shown?.id === parsed.id && shown.question === parsed.question && shown.ompCall === parsed.ompCall
-            && shown.nativeSteps?.index === parsed.nativeSteps?.index;
+            && shown.nativeSteps?.index === parsed.nativeSteps?.index
+            && (!onCursor || (shown.selectedIndex === cursor && ticked(shown) && (settled === null || (settled.selectedIndex === cursor && ticked(settled)))));
         };
+        // Hermes's multi-select: every key, the ticks after the first and the Enter that locks them, is on the same
+        // question, so each is checked against it as the first was, with the rows ticked as this answer's own Spaces left them
+        const togglesInPlace = responder === "hermes-question" && body.option_indices !== undefined;
+        const ticks = new Set(parsed.checkedOptionIndices);
+        function ticked(shown: ParsedPrompt): boolean {
+          return !togglesInPlace || (shown.checkedOptionIndices.length === ticks.size && shown.checkedOptionIndices.every((index) => ticks.has(index)));
+        }
         const sendStep = async (step: AnswerStep, move: boolean, more: boolean): Promise<void> => {
           const write = async (): Promise<void> => {
             const first = !move && !committed;
@@ -1830,9 +1916,11 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
           // with, as before. pi's look is as it was (pi-ask's own check, awaited with the request's deadline).
           const look = agent === "pi" ? deadline : AbortSignal.timeout(SETTLE_MS);
           const guardUntil = agent === "pi" ? null : Date.now() + SETTLE_MS;
-          if (!committed) {
+          if (!committed || togglesInPlace) {
             // every key up to the answer's first one that cannot be undone, that one included: the question as asked
-            const { written } = await verifyThenSend(look, guardUntil, Date.now() + SETTLE_MS, sameQuestion, () => ({ written: write() }),
+            const onCursor = !move && (step.keys?.every((key) => key === KEY.enter || key === KEY.space) ?? false);
+            const { written } = await verifyThenSend(look, guardUntil, Date.now() + SETTLE_MS,
+              (shown, screen, settled) => sameQuestion(shown, screen, onCursor, settled), () => ({ written: write() }),
               interaction !== undefined || responder === "pi-question" || responder === "pi-confirm" || responder.startsWith("fallback"));
             await written;
           } else {
@@ -1906,10 +1994,11 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
             }
             // GJC's selector can close under the answer: its composer must not take the moves.
             if (move && walked && (list || reader?.reread === "each-move" || responder === "fallback-gjc-menu") && !(await onRow())) return promptChanged();
-            if (!move && !committed) {
+            if (!move && (!committed || togglesInPlace)) {
               // The first irreversible step goes only once the menu shows the expected cursor.
-              // Later keys follow as before: the menu itself changes under them.
-              if (moved && !(await onRow())) return promptChanged();
+              // Later keys follow as before: the menu itself changes under them. Hermes's ticks and
+              // Enter after the first tick wait for the cursor and the ticks the last keys left.
+              if ((moved || (togglesInPlace && committed)) && !(await onRow())) return promptChanged();
               if (request.signal.aborted) return promptChanged();
             }
             // herdr may press the key and lose its reply; a possibly pressed key ends the asking.
@@ -1920,6 +2009,8 @@ export async function handlePromptRequest(request: Request, url: URL, options: P
               moved = true;
               walked = true;
               for (const key of step.keys!) cursor = key === KEY.down || key === KEY.right ? cursor + 1 : Math.max(0, cursor - 1);
+            } else if (togglesInPlace && step.keys?.length === 1 && step.keys[0] === KEY.space) {
+              if (!ticks.delete(cursor)) ticks.add(cursor);
             }
           }
         }

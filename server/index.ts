@@ -22,10 +22,16 @@ import { AGENT_CATALOG, catalogPlatform } from "../shared/agent-catalog.ts";
 import { AgentInstaller } from "./agent-catalog-install.ts";
 import { type BackgroundAgentDeps } from "./background-agent.ts";
 import { herdrSocketPath, ping } from "./herdr/client.ts";
-import { hcBin, startRuntime } from "./herdr-core/runtime.ts";
+import { coreConnection, hcBin, NoHerdrCoreError, servingCore, setRuntime, startRuntime } from "./herdr-core/runtime.ts";
+import { chooseRuntime, runtimeService, type RuntimeChoice, type RuntimeService } from "./herdr-core/runtime-choice.ts";
+import { bridgePins } from "./herdr-core/pin-label.ts";
+import { SeenMarker } from "./herdr-core/seen-label.ts";
+import { herdrCoreFacts } from "./herdr-core/discovery.ts";
+import { type HerdrCoreFacts, LOCAL_MACHINE } from "../shared/machines.ts";
 import { type AlertTiming, defaultStateDir } from "./push.ts";
 import { mergeSiblingState, siblingStateDir } from "./state-merge.ts";
 import { moveLegacyStateDir } from "./update-state.ts";
+import { sweepSshDirs } from "./ssh.ts";
 import { OpenCodePromptState } from "./prompt.ts";
 import { connectUpdater, type UpdateService } from "./update-api.ts";
 import { HerdrUpdater } from "./herdr-update.ts";
@@ -36,6 +42,7 @@ import { UsageService } from "./usage.ts";
 import { CLIProxyService } from "./cliproxy.ts";
 import { CLIProxyRoutes } from "./cliproxy-routes.ts";
 import { UsageLoginService } from "./usage-login.ts";
+import { UsageAccountList } from "./usage-account-list.ts";
 import { VoiceService } from "./voice.ts";
 import { loopbackRelay, registerBridge, relayTarget } from "./bridge.ts";
 import { PiSessionReader } from "./pi-session-metadata.ts";
@@ -106,6 +113,8 @@ export function createServer(
   options: {
     port?: number;
     hostname?: string;
+    /** Also listen on ::1 when the primary listener is bound to 127.0.0.1. */
+    ipv6Loopback?: boolean;
     token?: string;
     /** where VAPID keys and push subscriptions persist; tests pass a temp dir */
     stateDir?: string;
@@ -137,6 +146,12 @@ export function createServer(
     updates?: UpdateService;
     /** updates herdr itself (server/herdr-update.ts); unset, the app offers no herdr update. Tests pass one that runs a stand-in herdr. */
     herdrUpdate?: HerdrUpdater;
+    /** what this PC has of herdr-core, for Settings (server/herdr-core/discovery.ts); unset, health tells none. Tests pass a stand-in. */
+    herdrCoreFacts?: () => HerdrCoreFacts | undefined;
+    /** which runtime this server serves and the Settings switch (server/herdr-core/runtime-choice.ts); unset, health tells none and a switch is refused. Tests pass a stand-in. */
+    runtimeService?: RuntimeService;
+    /** whether the launcher took this bridge as its own after its startup check (server/supervisor.ts); unset, nothing is told */
+    launchAccepted?: () => boolean;
     /** a public address through Portal (server/portal.ts); unset, the app offers none. Tests pass one that runs a stand-in portal. */
     portal?: PortalService;
     /** Relay opt-in and identity persist in stateDir; tests can supply a local physical transport. */
@@ -210,6 +225,7 @@ export function createServer(
   const bootId = process.env["OVIS_BOOT_ID"] || randomUUID();
   const orderSequence = new OrderSequence(bootId);
   const hostname = options.hostname ?? process.env["HOST"] ?? "127.0.0.1";
+  const ipv6Loopback = (options.ipv6Loopback ?? process.env["OVIS_IPV6_LOOPBACK"] === "1") && hostname === "127.0.0.1";
   /** Empty token = gate disabled; every route then behaves exactly as it did before auth existed. */
   const token = options.token ?? process.env["OVIS_TOKEN"] ?? "";
   /** paired devices (server/devices.ts) and the PC's Tailscale login: the two ways in besides the token and this PC itself */
@@ -219,6 +235,8 @@ export function createServer(
   const merge = options.siblingStateDir ? mergeSiblingState(stateDir, options.siblingStateDir) : null;
   const devices = new DeviceStore(stateDir, merge?.devicesBlocked ?? null);
   const preferences = new PreferenceStore(stateDir);
+  // on herdr-core an agent pinned here is pinned in the Herdr app and its other clients too
+  const stopPinBridge = servingCore() ? bridgePins(coreConnection(), preferences, LOCAL_MACHINE, stateDir) : null;
   // Chat's own rewind (#1500, never released) kept its rewinds here; nothing reads them since #1577
   try {
     rmSync(join(stateDir, "claude-rewinds.json"), { force: true });
@@ -232,15 +250,22 @@ export function createServer(
   // a sign-in runs in a herdr tab, which outlives this server: the next one must know its home is taken (#2313)
   usageLogin.persistTo(stateDir);
   const usage = options.usage ?? new UsageService(undefined, undefined, (refresh) => cliProxy.report(refresh));
+  const usageAccounts = new UsageAccountList(stateDir, usage);
   // a sign-in the browser followed ends in the server's own PTY, not a herdr pane: it says so itself
-  usageLogin.onLoginEnded(() => usage.invalidate());
+  usageLogin.onLoginEnded((account) => {
+    usage.invalidate();
+    if (account !== null) {
+      try { usageAccounts.restore(account); }
+      catch (error) { console.warn("Could not restore the signed-in account to Ovis", error instanceof Error ? error.message : String(error)); }
+    }
+  });
   const voice = options.voice ?? new VoiceService({ stateDir, env: process.env, fetch });
   /** a login named here is taken as it is: a tagged node has none of its own to read (OVIS_TAILSCALE_OWNER) */
   const namedOwner = options.tailscaleOwner !== undefined ? options.tailscaleOwner : process.env["OVIS_TAILSCALE_OWNER"]?.trim() || undefined;
   const tailnet = options.tailnet ?? new TailnetIdentitySource();
-  const identityOf = async (grantPath: boolean, host: string | null) => {
+  const identityOf = async (grantPath: boolean, host: string | null, loginPath = false) => {
     if (namedOwner !== undefined) return { ...(grantPath ? await tailnet.freshIdentity(host) : { soleLogin: null, dnsName: null, tailnetIp: null }), owner: namedOwner, tagged: false };
-    return grantPath ? tailnet.freshIdentity(host) : tailnet.identity();
+    return grantPath ? tailnet.freshIdentity(host) : loginPath ? tailnet.loginIdentity() : tailnet.identity();
   };
   const serveOnly = options.tailscaleServeOnly ?? process.env["OVIS_TAILSCALE_SERVE_ONLY"] === "1";
   /** what lets Portal open an address: this server's own values, never a request's */
@@ -279,6 +304,15 @@ export function createServer(
   const { machines, collector, queueFirstMessage, push } = core;
   // read finishes are kept until this server knows their herdr run ended
   const seen = new SeenStore(stateDir, (pc, epoch) => machines?.finishEnded(pc, epoch) ?? false);
+  // on herdr-core a finish read here is read in the Herdr app and its other clients too: only the
+  // pane's finish now, so a read told late never marks a turn that ended since as seen
+  const seenMarker = servingCore() ? new SeenMarker(coreConnection()) : null;
+  if (seenMarker) seen.subscribe((finish) => {
+    if (finish.pc !== LOCAL_MACHINE || machines?.finishEnded(finish.pc, finish.epoch) !== false) return;
+    const pane = machines.list().find((machine) => machine.id === LOCAL_MACHINE)?.snapshot?.panes.find((candidate) => candidate.pane_id === finish.pane);
+    if (pane?.agent_status !== "done" || pane.finish_id !== finish.id) return;
+    seenMarker.mark(finish.pane).catch((error: unknown) => console.warn(`herdr-core: could not mark ${finish.pane} seen:`, error));
+  });
   // started after createCore's Node probe (server/pty/sidecar.ts), which can hold the thread up to 3 s: that wait
   // would count against the read's own 2.5 s limit, and a read cut short leaves the owner unknown for 5 minutes
   identityOf(false, null);
@@ -315,10 +349,27 @@ export function createServer(
 
     websocket: core.websocket,
   });
+  // bound before anything else opens, so a failed ::1 bind leaves only what a failed primary bind would
+  let ipv6: Bun.Server<SocketData> | null = null;
+  if (ipv6Loopback) {
+    try {
+      ipv6 = Bun.serve<SocketData>({
+        hostname: "::1", port: server.port, maxRequestBodySize: BUN_BODY_CEILING,
+        fetch: (request, bunServer) => handleRequest(request, socketContext(bunServer)),
+        websocket: core.websocket,
+      });
+    } catch (error) {
+      server.stop(true);
+      // createCore already started the status hub's watchers and timers
+      core.stop(() => clearInterval(draftTimer));
+      piReader.close();
+      throw error;
+    }
+  }
 
   const requestLog = new RequestLog(stateDir);
   const services: RequestServices = {
-    options, relay: ovisRelay, hostname, token, bridgeToken, bootId, devices, preferences, herdrSidebar, identityOf, serveOnly, portalGuards, shellAgents, agentDetector, agentOffered, agentInstaller, openCodeState, cliProxyRoutes, usageLogin, usage, voice, browserSnapshot, core, seen, piReader, orderSequence, clientConnectionLog, requestLog, portalStartup,
+    options, relay: ovisRelay, hostname, token, bridgeToken, bootId, devices, preferences, herdrSidebar, identityOf, serveOnly, portalGuards, shellAgents, agentDetector, agentOffered, agentInstaller, openCodeState, cliProxyRoutes, usageLogin, usage, usageAccounts, voice, browserSnapshot, core, seen, piReader, orderSequence, clientConnectionLog, requestLog, portalStartup,
     get portalStartupResult() { return portalStartupResult; },
   };
   ovisRelay.resume(services, server.port ?? DEFAULT_PORT);
@@ -380,11 +431,13 @@ export function createServer(
         releaseOpenCodeNative();
       });
       piReader.close();
+      stopPinBridge?.stop();
       // the followed sign-ins run in this server's own terminals: no dialog could reach them once it stops
       void usageLogin.stopAll();
       void shellAgents.stop();
       agentDetector.close();
       server.stop(true);
+      ipv6?.stop(true);
       releaseFilePool();
       releaseCommandHistory();
       requestLog.close();
@@ -394,12 +447,39 @@ export function createServer(
 
 if (import.meta.main) {
   moveLegacyStateDir();
+  // SSH connection folders an earlier server left in /tmp; here, not in createServer, so tests never touch them
+  void sweepSshDirs();
   // resolved once, for the same reason as in createServer
   const stateDir = defaultStateDir();
   // herdr-core's adapter is HERDR_SOCKET: it listens before anything below asks herdr
+  // the launcher says when it took this bridge as its own, past its startup check: a page following a
+  // runtime switch waits for that, never for a bridge the launcher may still roll back
+  let launchAccepted = process.env["OVIS_MANAGED"] !== "1";
+  process.on("message", (message: unknown) => {
+    if (message !== null && typeof message === "object" && (message as { type?: unknown }).type === "bridge-accepted") launchAccepted = true;
+  });
+  // OVIS_RUNTIME, else the choice saved from Settings, else what this PC has (runtime-choice.ts)
+  const startEnv = { ...process.env };
   let herdrCore: Awaited<ReturnType<typeof startRuntime>>;
+  let choice: RuntimeChoice;
+  let fallback: "no_herdr_core" | undefined;
   try {
-    herdrCore = await startRuntime(stateDir);
+    choice = await chooseRuntime({ stateDir, port: Number(startEnv["PORT"] || DEFAULT_PORT), env: startEnv });
+    setRuntime(choice.runtime);
+    console.log(`Runtime: ${choice.runtime} (${choice.reason})`);
+    try {
+      herdrCore = await startRuntime(stateDir);
+    } catch (err) {
+      // a choice saved from Settings whose core is gone falls back to herdr, where Settings can switch again;
+      // OVIS_RUNTIME says what to serve, and its failure stays an error
+      // only a missing hc: any other failure (a state folder, another Ovis) is the launcher's to roll back
+      if (choice.source !== "saved" || choice.runtime !== "herdr-core" || !(err instanceof NoHerdrCoreError)) throw err;
+      console.error(`The herdr-core chosen in Settings cannot start (${err instanceof Error ? err.message : String(err)}); serving herdr.`);
+      choice = { ...choice, runtime: "herdr" };
+      fallback = "no_herdr_core";
+      setRuntime("herdr");
+      herdrCore = null;
+    }
   } catch (err) {
     console.error(`Ovis cannot start: ${err instanceof Error ? err.message : String(err)}.`);
     process.exit(1);
@@ -411,7 +491,10 @@ if (import.meta.main) {
   const relay = new RelayService({ stateDir });
   let instance: ReturnType<typeof createServer>;
   try {
-    instance = createServer({ updates, herdrUpdate: new HerdrUpdater(), portal, relay, telemetry, registerBridge: true, herdrProfiles: readHerdrProfiles, shellAgents: new ShellAgentLocator(), agentDetector: new AgentDetector({ locate: catalogLocator({ probe: defaultLoginProbe() }) }), stateDir, siblingStateDir: siblingStateDir(stateDir) });
+    instance = createServer({ updates, herdrUpdate: new HerdrUpdater(), herdrCoreFacts,
+      launchAccepted: () => launchAccepted,
+      runtimeService: runtimeService({ stateDir, port: Number(startEnv["PORT"] || DEFAULT_PORT), serving: choice.runtime, source: choice.source, ...(fallback ? { fallback } : {}), env: startEnv, core: herdrCoreFacts, accepted: () => launchAccepted, restart: (id) => process.send?.({ type: "runtime-restart", id }) }),
+      portal, relay, telemetry, registerBridge: true, herdrProfiles: readHerdrProfiles, shellAgents: new ShellAgentLocator(), agentDetector: new AgentDetector({ locate: catalogLocator({ probe: defaultLoginProbe() }) }), stateDir, siblingStateDir: siblingStateDir(stateDir) });
     instance.warmAgentCatalog();
   } catch (err) {
     const { code, syscall } = err as { code?: string; syscall?: string };

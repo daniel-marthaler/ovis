@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CoreAttachSession } from "./attach-session.ts";
 import { HcConnection } from "./connection.ts";
+import { buildSnapshot } from "./snapshot.ts";
+import type { HerdrPane } from "../../shared/protocol.ts";
 
 /**
  * The hc client against a real hc, in a core of its own: a session name and state, config and
@@ -82,6 +84,14 @@ describe.skipIf(!bin)("hc client against a real hc", () => {
     expect({ stopped, killed: alive }).toEqual({ stopped: 0, killed: [] });
   }, TEST_MS);
 
+  it("publishes the schema hc-api.generated.ts was made from", async () => {
+    const proc = Bun.spawn([bin!, "schema"], { env: env!, stdout: "pipe", stderr: "ignore" });
+    const schema: unknown = JSON.parse(await new Response(proc.stdout).text());
+    expect(await proc.exited).toBe(0);
+    // a different hc: refresh with OVIS_HC_BIN=<it> bun run generate:types --refresh-hc
+    expect(schema).toEqual(JSON.parse(readFileSync(join(import.meta.dir, "..", "..", "scripts", "hc-schema.json"), "utf8")));
+  }, TEST_MS);
+
   it("speaks generation 1 in framed mode", async () => {
     const hello = await hc.hello();
     expect(hello.version).toMatch(/^\d+\.\d+\.\d+/);
@@ -91,7 +101,7 @@ describe.skipIf(!bin)("hc client against a real hc", () => {
   it("attaches, resizes, types, and hears the program's OSC 7501 status as events", async () => {
     const events: { type: string; terminal?: string; data?: Record<string, unknown> }[] = [];
     let pending = "";
-    const subscription = await hc.open<{ channel: number; seq: number }>("events.subscribe", {}, {
+    const subscription = await hc.open("events.subscribe", {}, {
       onData: (payload) => {
         pending += new TextDecoder().decode(payload);
         for (let at = pending.indexOf("\n"); at !== -1; at = pending.indexOf("\n")) {
@@ -106,20 +116,20 @@ describe.skipIf(!bin)("hc client against a real hc", () => {
     });
     const report = (state: string) => `printf '\\033]7501;state=${state}:app=ovis-test\\033\\\\'`;
     const script = `stty -echo; while IFS= read -r line; do case "$line" in w) ${report("working")};; d) ${report("done")};; esac; echo "got:$line"; done`;
-    const record = await hc.call<{ address: string }>("terminal.run", { argv: ["bash", "-c", script] });
+    const record = await hc.call("terminal.run", { argv: ["bash", "-c", script] });
 
     let screen = "";
-    const attach = await hc.open<{ channel: number }>("terminal.attach", { terminal: record.address, cols: 80, rows: 24 }, {
+    const attach = await hc.open("terminal.attach", { terminal: record.address, cols: 80, rows: 24 }, {
       onData: (payload) => { screen += new TextDecoder().decode(payload); wake(); },
       onClose: () => {},
     });
     await until("first paint", () => screen.length > 0);
-    const attached = await hc.call<{ cols: number; rows: number }>("terminal.get", { terminal: record.address });
+    const attached = await hc.call("terminal.get", { terminal: record.address });
     expect([attached.cols, attached.rows]).toEqual([80, 24]);
 
     attach.channel.resize(100, 30);
     await until("resize", () => events.some((event) => event.type === "size" && event.terminal === record.address && event.data?.["cols"] === 100));
-    const resized = await hc.call<{ cols: number; rows: number }>("terminal.get", { terminal: record.address });
+    const resized = await hc.call("terminal.get", { terminal: record.address });
     expect([resized.cols, resized.rows]).toEqual([100, 30]);
 
     const stateOf = (event: (typeof events)[number]) => (event.data?.["status"] as { state?: string } | null | undefined)?.state;
@@ -137,10 +147,33 @@ describe.skipIf(!bin)("hc client against a real hc", () => {
     await subscription.channel.close();
   }, TEST_MS);
 
+  it("gets a reply the viewer's terminal made itself to the program, whether or not hc confirms automatic input", async () => {
+    const hello = await hc.hello();
+    const record = await hc.call("terminal.run", { argv: ["bash", "-c", "stty -echo; IFS= read -r line; echo \"got:$line\"; exit 3"] });
+    let screen = "";
+    const exit = Promise.withResolvers<number | null>();
+    const session = new CoreAttachSession({
+      hc,
+      terminal: record.address,
+      cols: 80,
+      rows: 24,
+      onData: (data) => { screen += data; wake(); },
+      onExit: (code) => exit.resolve(code),
+    });
+    await until("first paint", () => screen.length > 0);
+    // a core without the feature must get it as DATA: AUTOMATIC_INPUT it does not know would be dropped
+    session.write("auto\r", true);
+    expect(await exit.promise).toBe(3);
+    expect(screen).toContain("got:auto");
+    // what the pinned core says, for whoever raises the pin: hc 0.1.14 to 0.1.17 do not name the feature
+    console.info(`hc ${hello.version} automatic_input: ${hello.features.includes("automatic_input")}`);
+    await hc.call("terminal.rm", { terminal: record.address });
+  }, TEST_MS);
+
   it("streams a terminal through CoreAttachSession: typing, a resize, and the program's exit code", async () => {
-    const record = await hc.call<{ address: string }>("terminal.run", { argv: ["bash", "-c", "stty -echo; IFS= read -r line; echo \"got:$line\"; exit 7"] });
+    const record = await hc.call("terminal.run", { argv: ["bash", "-c", "stty -echo; IFS= read -r line; echo \"got:$line\"; exit 7"] });
     let sizes = "";
-    const events = await hc.open<{ channel: number }>("events.subscribe", { terminal: record.address }, {
+    const events = await hc.open("events.subscribe", { terminal: record.address }, {
       onData: (payload) => { sizes += new TextDecoder().decode(payload); wake(); },
       onClose: () => {},
     });
@@ -157,12 +190,55 @@ describe.skipIf(!bin)("hc client against a real hc", () => {
     await until("first paint", () => screen.length > 0);
     session.resize(90, 20);
     await until("resize", () => sizes.includes('"cols":90'));
-    const sized = await hc.call<{ cols: number; rows: number }>("terminal.get", { terminal: record.address });
+    const sized = await hc.call("terminal.get", { terminal: record.address });
     expect([sized.cols, sized.rows]).toEqual([90, 20]);
     session.write("hi\r");
     expect(await exit.promise).toBe(7);
     expect(screen).toContain("got:hi");
     events.channel.close();
     await hc.call("terminal.rm", { terminal: record.address });
+  }, TEST_MS);
+  it("places an hc run child after its parent's tab and carries its OSC 7501 kind, message and progress", async () => {
+    const events: { type: string; terminal?: string; data?: Record<string, unknown> }[] = [];
+    let pending = "";
+    const subscription = await hc.open("events.subscribe", {}, {
+      onData: (payload) => {
+        pending += new TextDecoder().decode(payload);
+        for (let at = pending.indexOf("\n"); at !== -1; at = pending.indexOf("\n")) {
+          const message = JSON.parse(pending.slice(0, at)) as { method: string; params: { type: string; terminal?: string; data?: Record<string, unknown> } };
+          pending = pending.slice(at + 1);
+          if (message.method === "event") events.push(message.params);
+        }
+        wake();
+      },
+      onClose: () => {},
+    });
+    // the spec's msg is base64; hc keeps it decoded
+    const msg = Buffer.from("Allow bash: rm -rf build?").toString("base64");
+    const child = `printf '\\033]7501;state=blocked:app=codex:kind=permission:progress=60:msg=${msg}\\033\\\\'; sleep 30`;
+    // started from inside the parent, as an agent starts a helper: hc names the parent from HC_TERMINAL_ID
+    const parent = await hc.call("terminal.run", {
+      argv: ["bash", "-c", '"$OVIS_TEST_HC" run --bg --name helper -- bash -c "$OVIS_TEST_CHILD"; sleep 30'],
+      env: { OVIS_TEST_HC: bin!, OVIS_TEST_CHILD: child },
+      labels: { "herdr.space": "s-live", "herdr.tab": "t-live" },
+    });
+    const statusOf = (event: (typeof events)[number]) => event.data?.["status"] as { state?: string; kind?: string } | null | undefined;
+    await until("the child's blocked report", () => events.some((event) => event.type === "status" && event.terminal !== parent.address && statusOf(event)?.kind === "permission"));
+    const childAddress = events.find((event) => event.type === "status" && statusOf(event)?.kind === "permission")!.terminal!;
+
+    const list = await hc.call("terminal.list", {});
+    const snapshot = buildSnapshot(list.terminals, null, "live");
+    expect(snapshot.tabs.filter((tab) => tab.workspace_id === "s-live").map((tab) => tab.tab_id)).toEqual(["t-live", `s-live:${childAddress}`]);
+    expect(snapshot.panes.find((pane) => pane.pane_id === childAddress)).toMatchObject({
+      workspace_id: "s-live", parent_pane_id: parent.address, agent_status: "blocked", agent: "codex",
+      agent_kind: "permission", agent_message: "Allow bash: rm -rf build?", agent_progress: 60,
+    } satisfies Partial<HerdrPane>);
+
+    for (const address of [childAddress, parent.address]) {
+      await hc.call("terminal.kill", { terminal: address });
+      await until(`${address} finished`, () => events.some((event) => event.type === "finished" && event.terminal === address));
+      await hc.call("terminal.rm", { terminal: address });
+    }
+    await subscription.channel.close();
   }, TEST_MS);
 });

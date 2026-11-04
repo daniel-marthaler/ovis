@@ -25,6 +25,11 @@ export interface UsageLoginAccounts {
   readonly accounts: readonly (string | null)[];
 }
 
+/** DELETE /api/usage/accounts removes a listed account from Ovis, POST restores a removed one: never revokes or deletes CLI credentials. */
+export interface UsageAccountRemoval {
+  readonly account: string;
+}
+
 /** What a login pane asks of its user, read from its screen: never a token, only what the CLI shows to type or open. */
 export interface UsageLoginPromptText {
   /** the sign-in page to open, on the provider's own host; null until the CLI prints it */
@@ -38,8 +43,15 @@ export interface UsageLoginPromptText {
 /** GET /api/usage/login/prompt?login=: a sign-in the browser follows, as its CLI's screen shows it. */
 export interface UsageLoginPrompt extends UsageLoginPromptText {
   readonly provider: "claude" | "codex";
-  /** the CLI has exited: whether it signed in, the accounts (GET /api/usage) tell */
+  /** the CLI has exited */
   readonly ended: boolean;
+  /**
+   * Present once ended: the CLI exited 0 and wrote a usable sign-in in its own credential home, one other
+   * than the one there before it started. Absent from an older server, whose end only the accounts tell.
+   */
+  readonly succeeded?: boolean;
+  /** Present once ended: the account that sign-in is to, as GET /api/usage/login?provider= names it; null when it names none */
+  readonly account?: string | null;
 }
 
 /** POST /api/usage/login/code: the code a sign-in page showed, typed into that login's CLI. */

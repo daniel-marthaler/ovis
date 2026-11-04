@@ -5,8 +5,8 @@ import { AGENT_LABELS } from "../agents-routes.ts";
 import { LINE_BYTES, makeLineReader } from "../herdr/client.ts";
 import { SHELL_AGENTS, shellCommandLine } from "../shell-agent.ts";
 import { type HcConnection, HcError } from "./connection.ts";
-import { agentInfoOf, agentOfStatus, agentStatusOf, buildSnapshot, type HcTerminal, hcKeyName, HERDR_PROTOCOL, isRecord, keyBytes, LAYOUT_DOC, OTHER_WORKSPACE_ID, processInfoOf, SPACE_LABEL, TAB_LABEL, TAB_NAME_LABEL, WORKSPACE_NAME_LABEL } from "./snapshot.ts";
-import type { SessionSnapshot } from "../../shared/herdr-api.generated.ts";
+import { agentInfoOf, agentOfStatus, agentStatusOf, buildSnapshot, type FirstTurn, reportedFacts, type HcStatus, type HcTerminal, hcKeyName, HERDR_PROTOCOL, isRecord, keyBytes, LAYOUT_DOC, OTHER_WORKSPACE_ID, processInfoOf, SEEN_LABEL, shownStatusOf, SPACE_LABEL, TAB_LABEL, TAB_NAME_LABEL, WORKSPACE_NAME_LABEL } from "./snapshot.ts";
+import type { AgentStatus, SessionSnapshot } from "../../shared/herdr-api.generated.ts";
 
 /**
  * herdr's socket API, answered from herdr-core. The server talks to herdr through one client
@@ -47,6 +47,21 @@ class AdapterError extends Error {
 /** Ovis's subscription types that are status, not structure. */
 const STATUS_EVENT = "pane.agent_status_changed";
 const NOT_STRUCTURE = new Set([STATUS_EVENT, "pane.focused", "pane.output_matched"]);
+/**
+ * What of a status the rows draw beyond its state, as `subscribe` compares reports: the kind and
+ * message of a blocked agent, and its progress, which the rows print as its exact percent.
+ */
+function shownFacts(report: unknown): string {
+  if (!isRecord(report) || typeof report["state"] !== "string") return NO_FACTS;
+  const facts = reportedFacts({
+    state: report["state"],
+    ...(typeof report["kind"] === "string" ? { kind: report["kind"] } : {}),
+    ...(typeof report["msg"] === "string" ? { msg: report["msg"] } : {}),
+    ...(typeof report["progress"] === "number" ? { progress: report["progress"] } : {}),
+  });
+  return JSON.stringify([facts.agent_kind ?? null, facts.agent_message ?? null, facts.agent_progress ?? null]);
+}
+const NO_FACTS = JSON.stringify([null, null, null]);
 /** A status or layout notification must fit in 4 MiB, even across hc frames. */
 const EVENT_LINE_BYTES = 4 * 1024 * 1024;
 
@@ -80,7 +95,15 @@ export async function startHerdrCoreAdapter(hc: HcConnection, socketPath: string
     if (live) throw new Error("Another Ovis owns this state directory: the herdr-core socket is still listening");
     rmSync(socketPath, { force: true });
   }
-  const answers = createAnswers(hc);
+  // the turn each terminal had when this server first saw it: without `herdr.seen`, a turn that
+  // ended since is done, in the snapshot and the events alike (snapshot.ts `shownStatusOf`)
+  const firstTurns = new Map<string, number>();
+  const firstTurn = (terminal: { address: string; turn?: number }): number => {
+    if (!firstTurns.has(terminal.address)) firstTurns.set(terminal.address, terminal.turn ?? 0);
+    return firstTurns.get(terminal.address)!;
+  };
+  const forgetTurns = (live: ReadonlySet<string>) => { for (const address of firstTurns.keys()) if (!live.has(address)) firstTurns.delete(address); };
+  const answers = createAnswers(hc, firstTurn, forgetTurns);
   const listener = Bun.listen<ConnectionState>({
     unix: socketPath,
     socket: {
@@ -97,7 +120,7 @@ export async function startHerdrCoreAdapter(hc: HcConnection, socketPath: string
             first = false;
             const request = parseRequest(line);
             if (!request) { send(socket, `${JSON.stringify({ id: "", error: { code: "bad_frame", message: "not a herdr request" } })}\n`, true); return; }
-            if (request.method === "events.subscribe") { void subscribe(hc, socket, request); return; }
+            if (request.method === "events.subscribe") { void subscribe(hc, socket, request, firstTurn); return; }
             void answers(request).then((reply) => send(socket, `${JSON.stringify({ id: request.id, ...reply })}\n`, true));
           }, () => socket.end()),
         };
@@ -176,6 +199,71 @@ const plainShell = (argv: readonly string[]): boolean => SHELL.test(argv[0] ?? "
 /** How long a typed agent start may take to show in front of its shell. */
 const AGENT_START_MS = 10_000;
 
+/** What hc sends right after the screen in a first paint: the win32-input-mode state (herdr-core viewers.rs `first_paint`). */
+const PAINT_END = "\u001b[?9001";
+/** How long a watch-only attach may take to bring its first paint: within the 1.5s a prompt poll gives its colored read. */
+const PAINT_MS = 1_000;
+/** Any escape sequence: CSI, OSC, a DCS/SOS/PM/APC string, or a short escape (HTS, a charset designation). */
+const ESCAPE_RE = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[PX^_][^\u001b]*\u001b\\|[ -/]*[0-~])/g;
+const SGR_RE = /^\u001b\[[0-9;:]*m$/;
+
+/**
+ * What hc's text read of the screen (`terminal.read`, no history) shows, with its colors, from the
+ * first paint of an attach that asked for `rows` lines of history: one line per row with its SGR
+ * attributes and no other escape (cursor moves, modes, tab stops, title). hc's read trims the
+ * spaces at the end of each row (a U+00A0 stays), drops the screen's blank rows at the bottom and
+ * takes as many history lines in at the top, so this does too, but for a space drawn in a color:
+ * that one tells input from padding (OpenCode's Tab space), and a text compare trims it anyway. hc paints after a
+ * clear (`CSI H CSI 2J`): the history, pushed up by an SGR reset, a line break and one more per
+ * screen row, then a second clear and the screen, which ends where the win32-input-mode state
+ * follows (herdr-core ghostty-vt `paint`, viewers.rs `first_paint`). null for a paint not shaped
+ * so. A row the terminal soft-wrapped stays a line of its own, as on the screen, where hc's text
+ * read joins it with the next.
+ */
+export function paintedScreen(paint: string, rows: number): string | null {
+  const end = paint.indexOf(PAINT_END);
+  const parts = paint.slice(0, Math.max(end, 0)).split("\u001b[H\u001b[2J");
+  if (end === -1 || parts.length < 2 || parts.length > 3) return null;
+  const text = (part: string): string => part.replace(ESCAPE_RE, (sequence) => (SGR_RE.test(sequence) ? sequence : ""))
+    .replace(/\r\n/g, "\n").replace(/\r/g, "");
+  const pushed = "\n".repeat(rows + 1);
+  const history = parts.length === 3 ? text(parts[1]!) : "";
+  if (history !== "" && !history.endsWith(pushed)) return null;
+  const lines = [...(history === "" ? [] : history.slice(0, -pushed.length).split("\n")), ...text(parts.at(-1)!).split("\n")]
+    .map(withoutPlainTrailingSpaces);
+  while (lines.length > 0 && lines.at(-1)!.replace(/\u001b\[[0-9;:]*m/g, "") === "") lines.pop();
+  return lines.slice(-rows).join("\n");
+}
+
+/** A line with the spaces at its end taken out, but for those drawn in a foreground or background color; its SGR codes stay. */
+function withoutPlainTrailingSpaces(line: string): string {
+  const pieces = line.split(/(\u001b\[[0-9;:]*m)/);
+  let fg = false;
+  let bg = false;
+  const colored = pieces.map((piece) => {
+    if (!piece.startsWith("\u001b")) return fg || bg;
+    const codes = piece.slice(2, -1).split(/[;:]/).map((code) => Number(code || 0));
+    for (let index = 0; index < codes.length; index++) {
+      const code = codes[index]!;
+      if (code === 0) { fg = false; bg = false; }
+      else if (code === 39) fg = false;
+      else if (code === 49) bg = false;
+      else if (code === 38 || code === 48) { if (code === 38) fg = true; else bg = true; index += codes[index + 1] === 5 ? 2 : codes[index + 1] === 2 ? 4 : 0; }
+      else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) fg = true;
+      else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) bg = true;
+    }
+    return false;
+  });
+  for (let index = pieces.length - 1; index >= 0; index--) {
+    if (pieces[index]!.startsWith("\u001b")) continue;
+    if (colored[index]) break;
+    const kept = pieces[index]!.replace(/ +$/, "");
+    pieces[index] = kept;
+    if (kept !== "") break;
+  }
+  return pieces.join("");
+}
+
 function paneIdOf(params: Record<string, unknown>, field = "pane_id"): string {
   const value = params[field];
   if (typeof value !== "string" || value === "") throw new AdapterError("invalid_params", `${field} is required`);
@@ -198,23 +286,23 @@ function herdrCode(error: HcError, missing: string): string {
   }
 }
 
-function createAnswers(hc: HcConnection): (request: Request) => Promise<Reply> {
+function createAnswers(hc: HcConnection, firstTurn: FirstTurn, forgetTurns: (live: ReadonlySet<string>) => void): (request: Request) => Promise<Reply> {
   const terminal = async (address: string, missing = "pane_not_found"): Promise<HcTerminal> => {
-    const record = await hc.call<{ terminal: HcTerminal } | HcTerminal>("terminal.get", { terminal: address }).catch((error: unknown) => {
+    const found = await hc.call("terminal.get", { terminal: address }).catch((error: unknown) => {
       throw error instanceof HcError ? new AdapterError(herdrCode(error, missing), error.message) : error;
     });
-    const found = "terminal" in record ? record.terminal : record;
     if (found.state !== "live") throw new AdapterError(missing, `terminal ${address} has finished`);
     return found;
   };
 
   const snapshot = async (): Promise<SessionSnapshot> => {
     const [list, doc, hello] = await Promise.all([
-      hc.call<{ terminals: HcTerminal[] }>("terminal.list", {}),
-      hc.call<{ value: unknown }>("doc.get", { name: LAYOUT_DOC }),
+      hc.call("terminal.list", {}),
+      hc.call("doc.get", { name: LAYOUT_DOC }),
       hc.hello(),
     ]);
-    return buildSnapshot(list.terminals, doc.value, hello.version);
+    forgetTurns(new Set(list.terminals.map((terminal) => terminal.address)));
+    return buildSnapshot(list.terminals, doc.value, hello.version, firstTurn);
   };
 
   const paneOf = async (paneId: string, missing = "pane_not_found") => {
@@ -230,12 +318,46 @@ function createAnswers(hc: HcConnection): (request: Request) => Promise<Reply> {
    */
   const type = async (paneId: string, bytes: string): Promise<void> => {
     const record = await terminal(paneId);
-    const { result, channel } = await hc.open<{ channel: number; terminal?: HcTerminal }>("terminal.attach", { terminal: paneId, cols: record.cols, rows: record.rows }, { onData: () => {}, onClose: () => {} });
+    const { result, channel } = await hc.open("terminal.attach", { terminal: paneId, cols: record.cols, rows: record.rows }, { onData: () => {}, onClose: () => {} });
     // resized since it was looked up: type at the size it has now
     const now = result.terminal;
     if (now && (now.cols !== record.cols || now.rows !== record.rows)) channel.resize(now.cols, now.rows);
     channel.write(bytes);
     await channel.close();
+  };
+
+  /**
+   * hc's text read of the screen with its colors (paintedScreen): hc reads text only, so this is the
+   * first paint of an attach that only watches, which never types or resizes, closed once the screen
+   * is in. No paint within PAINT_MS, a stream that ends first, or a paint of another shape answers
+   * the plain text, as a read without colors.
+   */
+  const coloredScreen = async (paneId: string): Promise<string> => {
+    const record = await terminal(paneId);
+    const decoder = new TextDecoder();
+    let paint = "";
+    const { promise, resolve } = Promise.withResolvers<string | null>();
+    const timer = setTimeout(() => resolve(null), PAINT_MS);
+    const { result, channel } = await hc.open("terminal.attach", { terminal: paneId, cols: record.cols, rows: record.rows, history: record.rows, observe: true }, {
+      onData: (payload) => {
+        paint += decoder.decode(payload, { stream: true });
+        if (paint.includes(PAINT_END)) resolve(paint);
+      },
+      onClose: () => resolve(null),
+    }).catch((error: unknown) => {
+      clearTimeout(timer);
+      throw error;
+    });
+    let screen: string | null;
+    try {
+      const painted = await promise;
+      // resized since it was looked up: the paint has the rows it has now
+      screen = painted === null ? null : paintedScreen(painted, result.terminal?.rows ?? record.rows);
+    } finally {
+      clearTimeout(timer);
+      await channel.close();
+    }
+    return screen ?? (await hc.call("terminal.read", { terminal: paneId, lines: 0 })).text;
   };
 
   /** Input to one pane in the order it was asked for: each attach and its bytes finish before the next. */
@@ -254,7 +376,8 @@ function createAnswers(hc: HcConnection): (request: Request) => Promise<Reply> {
    */
   const startShell = async (params: Record<string, unknown>, labels: Record<string, string>) => {
     const env = isRecord(params["env"]) ? Object.fromEntries(Object.entries(params["env"]).filter((entry): entry is [string, string] => typeof entry[1] === "string")) : undefined;
-    const record = await hc.call<HcTerminal>("terminal.run", { keep: true, labels, ...(typeof params["cwd"] === "string" ? { cwd: params["cwd"] } : {}), ...(env ? { env } : {}) });
+    // a terminal a client starts has had nothing finish yet (herdr-app docs/labels.md)
+    const record = await hc.call("terminal.run", { keep: true, labels: { [SEEN_LABEL]: "0", ...labels }, ...(typeof params["cwd"] === "string" ? { cwd: params["cwd"] } : {}), ...(env ? { env } : {}) });
     const shown = await snapshot();
     const root_pane = shown.panes.find((pane) => pane.pane_id === record.address);
     const tab = root_pane && shown.tabs.find((candidate) => candidate.tab_id === root_pane.tab_id);
@@ -302,8 +425,11 @@ function createAnswers(hc: HcConnection): (request: Request) => Promise<Reply> {
       const format = typeof params["format"] === "string" ? params["format"] : "text";
       const recent = source === "recent" || source === "recent_unwrapped";
       const wanted = typeof params["lines"] === "number" && params["lines"] > 0 ? Math.floor(params["lines"]) : null;
+      if (format === "ansi" && source === "visible" && params["strip_ansi"] !== true) {
+        return { read: { pane_id: paneId, workspace_id: pane.workspace_id, tab_id: pane.tab_id, source, format, text: await coloredScreen(paneId), revision: pane.revision, truncated: false } };
+      }
       // hc reads the screen plus `lines` of history above it; herdr's recent read is the last `lines` lines
-      const read = await hc.call<{ text: string; complete: boolean }>("terminal.read", { terminal: paneId, lines: recent ? wanted ?? 1000 : 0 });
+      const read = await hc.call("terminal.read", { terminal: paneId, lines: recent ? wanted ?? 1000 : 0 });
       let text = read.text;
       if (recent && wanted !== null) {
         const rows = text.split("\n");
@@ -466,13 +592,26 @@ function createAnswers(hc: HcConnection): (request: Request) => Promise<Reply> {
 /** One hc event notification (herdr-core schema/README.md, Events). */
 interface HcEvent { type: string; terminal?: string; data?: Record<string, unknown> }
 
+/** A status report as hc sends it in a record or a `status` event; null when it is none. */
+function statusOf(reported: unknown): HcStatus | null {
+  return isRecord(reported) && typeof reported["state"] === "string"
+    ? { state: reported["state"], ...(typeof reported["app"] === "string" ? { app: reported["app"] } : {}) }
+    : null;
+}
+
+/** A terminal's labels as hc sends them, its string values only. */
+function labelsOf(labels: unknown): Record<string, string> {
+  if (!isRecord(labels)) return {};
+  return Object.fromEntries(Object.entries(labels).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+}
+
 /**
  * An events subscription: herdr's acknowledgement once hc's own stream is open, so nothing that
  * happens after the server's next snapshot is missed, then herdr's frames for what hc reports. A
  * subscriber that fell behind on hc (`missed`), or a line to hc that ended, ends this connection:
  * the status collector reopens it and reads what it missed from a fresh snapshot.
  */
-async function subscribe(hc: HcConnection, socket: Socket<ConnectionState>, request: Request): Promise<void> {
+async function subscribe(hc: HcConnection, socket: Socket<ConnectionState>, request: Request, firstTurn: FirstTurn): Promise<void> {
   const subscriptions = Array.isArray(request.params["subscriptions"]) ? request.params["subscriptions"].filter(isRecord) : [];
   const statusPanes = new Set(subscriptions.flatMap((entry) => entry["type"] === STATUS_EVENT && typeof entry["pane_id"] === "string" ? [entry["pane_id"]] : []));
   const structure = subscriptions.some((entry) => typeof entry["type"] === "string" && !NOT_STRUCTURE.has(entry["type"]));
@@ -504,40 +643,104 @@ async function subscribe(hc: HcConnection, socket: Socket<ConnectionState>, requ
   const lifecycle = (event: string, type: string, paneId?: string) => {
     if (structure) emit(event, { type, ...(paneId ? { pane_id: paneId } : {}) });
   };
+  /**
+   * What each terminal's status is shown from, as the snapshot shows it (snapshot.ts
+   * `shownStatusOf`): its program's word, its turn and its labels, from hc's snapshot and then its
+   * events, with the status last told. Until hc's snapshot is in, events wait in `early`.
+   */
+  const known = new Map<string, { status: HcStatus | null; turn: number; first: number; labels: Record<string, string>; shown: AgentStatus }>();
+  let early: HcEvent[] | null = [];
+  const remember = (record: unknown) => {
+    if (!isRecord(record) || typeof record["address"] !== "string") return;
+    const status = statusOf(record["status"]);
+    const turn = typeof record["turn"] === "number" ? record["turn"] : 0;
+    const labels = labelsOf(record["labels"]);
+    const first = firstTurn({ address: record["address"], turn });
+    known.set(record["address"], { status, turn, first, labels, shown: shownStatusOf(status, turn, labels, first) });
+  };
+  const tell = (paneId: string, status: HcStatus | null, shown: AgentStatus) => {
+    emit(STATUS_EVENT, { pane_id: paneId, agent_status: shown, agent: agentOfStatus(status) });
+  };
+  /** A turn or a look (the `herdr.seen` label) that changes what a terminal shows is told as its status. */
+  const retell = (paneId: string) => {
+    const entry = known.get(paneId);
+    if (!entry) return;
+    const shown = shownStatusOf(entry.status, entry.turn, entry.labels, entry.first);
+    if (shown === entry.shown) return;
+    entry.shown = shown;
+    if (statusPanes.has(paneId)) tell(paneId, entry.status, shown);
+  };
+  /** what each terminal's last report said beyond its state (kind, message, progress), which only a snapshot carries */
+  const reported = new Map<string, string>();
   const onEvent = (event: HcEvent) => {
+    if (early) { early.push(event); return; }
     const paneId = event.terminal;
     switch (event.type) {
       case "status": {
-        if (!paneId || !statusPanes.has(paneId)) return;
-        const reported = event.data?.["status"];
-        const status = isRecord(reported) && typeof reported["state"] === "string"
-          ? { state: reported["state"], ...(typeof reported["app"] === "string" ? { app: reported["app"] } : {}) }
-          : null;
-        emit(STATUS_EVENT, { pane_id: paneId, agent_status: agentStatusOf(status), agent: agentOfStatus(status) });
+        if (!paneId) return;
+        const report = event.data?.["status"];
+        // a new kind, message or progress step (or one gone) reaches the rows through a fresh snapshot
+        const facts = shownFacts(report);
+        const before = reported.get(paneId) ?? NO_FACTS;
+        reported.set(paneId, facts);
+        if (facts !== before) lifecycle("pane.updated", "pane_updated", paneId);
+        const status = statusOf(report);
+        const entry = known.get(paneId);
+        if (!entry) {
+          if (statusPanes.has(paneId)) tell(paneId, status, agentStatusOf(status));
+          return;
+        }
+        const was = entry.status?.state;
+        entry.status = status;
+        const shown = shownStatusOf(status, entry.turn, entry.labels, entry.first);
+        // a turn ends with this status, then the `turn` event that counts it: whether it is done
+        // is decided there (herdr-app docs/labels.md)
+        if (was === "working" && (shown === "idle" || shown === "done")) return;
+        entry.shown = shown;
+        if (statusPanes.has(paneId)) tell(paneId, status, shown);
+        return;
+      }
+      case "turn": {
+        const entry = paneId ? known.get(paneId) : undefined;
+        if (!entry || typeof event.data?.["turn"] !== "number") return;
+        entry.turn = event.data["turn"];
+        retell(paneId!);
         return;
       }
       case "created":
+        remember(event.data);
         lifecycle("pane.created", "pane_created", paneId);
         return;
       case "finished":
-        lifecycle("pane.exited", "pane_exited", paneId);
+        // herdr says pane_exited only for a program that ended by itself; a pane someone closed is
+        // pane_closed alone, so it raises no "terminal ended" alert. hc's `killed` is a
+        // terminal.kill (the Herdr app closing a tab, Ovis's pane.close, `hc kill`); a signal sent
+        // from anywhere else finishes as `exited`
+        if (event.data?.["reason"] !== "killed") lifecycle("pane.exited", "pane_exited", paneId);
         lifecycle("pane.closed", "pane_closed", paneId);
         return;
       case "removed":
+        if (paneId) { known.delete(paneId); reported.delete(paneId); }
         lifecycle("pane.closed", "pane_closed", paneId);
         return;
       case "lost":
       case "restarted":
         lifecycle("pane.updated", "pane_updated", paneId);
         return;
-      case "labels":
+      case "labels": {
+        const entry = paneId ? known.get(paneId) : undefined;
+        if (entry) {
+          entry.labels = labelsOf(event.data?.["labels"]);
+          retell(paneId!);
+        }
         lifecycle("layout.updated", "layout_updated");
         return;
+      }
       case "doc":
         if (event.data?.["name"] === LAYOUT_DOC) lifecycle("layout.updated", "layout_updated");
         return;
       default:
-        // title, size, foreground and turn change many times a second and show in the next snapshot
+        // title, size and foreground change many times a second and show in the next snapshot
         return;
     }
   };
@@ -555,7 +758,16 @@ async function subscribe(hc: HcConnection, socket: Socket<ConnectionState>, requ
     send(socket, `${JSON.stringify({ id: request.id, error: { code: "bad_frame", message: `hc event line exceeds ${EVENT_LINE_BYTES} bytes` } })}\n`, true);
   });
   try {
-    const { channel } = await hc.open("events.subscribe", {}, { onData: read, onClose: end });
+    const { result, channel } = await hc.open("events.subscribe", {}, { onData: read, onClose: end });
+    // what each terminal reported as the stream starts: a first event that drops a message or progress is a change
+    for (const terminal of Array.isArray(result.terminals) ? result.terminals : []) {
+      if (!isRecord(terminal) || typeof terminal["address"] !== "string" || reported.has(terminal["address"])) continue;
+      reported.set(terminal["address"], shownFacts(terminal["status"]));
+    }
+    for (const record of result.terminals ?? []) remember(record);
+    const waiting = early ?? [];
+    early = null;
+    for (const event of waiting) onEvent(event);
     // the herdr side went, or hc's stream did (`missed` can come with the answer), before the
     // acknowledgement: nothing is started, and hc's stream goes too
     if (ended || socket.data.closed || socket.data.ending) {

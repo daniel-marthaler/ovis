@@ -6,7 +6,7 @@
  * move made elsewhere (herdr's TUI), are not seen here.
  */
 import { paneStorageId } from "../../shared/machines.ts";
-import { composerDrafts, type ComposerDraftStore } from "./composerDraft.ts";
+import { composerDrafts, sendLease, underSendLock, type ComposerDraftStore } from "./composerDraft.ts";
 import { paneLifetimes } from "./paneLifetime.ts";
 import { PANE_VIEW_KEY_PREFIX } from "./settings.ts";
 import { REPLY_COMMENTS_PREFIX, replyComments, type ReplyCommentStore } from "./replyComments.ts";
@@ -21,9 +21,24 @@ export function carryPaneState(machineId: string, from: string, to: string, draf
   const before = paneStorageId(machineId, from);
   const after = paneStorageId(machineId, to);
   // the comments waiting on its replies (#511) all go with it, a send on its way or not: that send removes
-  // the ones it carried from wherever they went once it is acknowledged
-  comments.move(REPLY_COMMENTS_PREFIX + before, REPLY_COMMENTS_PREFIX + after);
-  drafts.move(`ovis:composer-draft:${before}`, `ovis:composer-draft:${after}`);
+  // the ones it carried from wherever they went once it is acknowledged. Inside the old ID's send lock, so
+  // no tab's send claims them half moved (#2369)
+  underSendLock(`ovis:composer-draft:${before}`, () => {
+    // a send on its way from any tab (its lease) may be acknowledged in a tab that did not move the pane (#2356)
+    const draft = `ovis:composer-draft:${before}`;
+    const lease = sendLease(storage(), draft);
+    comments.move(REPLY_COMMENTS_PREFIX + before, REPLY_COMMENTS_PREFIX + after, lease && { draft, at: lease.at });
+    // the comments held for that send are free once it ends: another tab hears it as a storage event, this one here
+    if (lease !== null) {
+      drafts.refresh(draft);
+      const unsubscribe = drafts.subscribe(() => {
+        if (drafts.read(draft).sending) return;
+        unsubscribe();
+        comments.refresh();
+      });
+    }
+    drafts.move(`ovis:composer-draft:${before}`, `ovis:composer-draft:${after}`);
+  });
   // a touch screen's terminal input line, through its store (it keeps the line in memory too); a
   // line on its way stays, as a chat draft on its way does
   const line = readTerminalDraft(before);

@@ -8,7 +8,7 @@ import type { ClientMessage, ClientRole, ServerFeature, SessionSnapshot } from "
 import { ConnectionDiagnostics } from "../connection-diagnostics.ts";
 import { HerdrError, LARGE_REPLY_BYTES } from "../herdr/client.ts";
 import { OUTPUT_HARD_BYTES } from "../output-window.ts";
-import { type Client, connectionOf, presenceOf, send, type SocketData } from "./connections.ts";
+import { type Client, connectionOf, presenceOf, send, setMachineEvents, type SocketData } from "./connections.ts";
 import { type AttachmentView, validGeometry } from "./terminals.ts";
 import type { TelemetryIngress, TelemetrySurface } from "../../shared/telemetry.ts";
 
@@ -27,9 +27,9 @@ export type SocketHandler = Omit<WebSocketHandler<SocketData>, "open" | "message
 };
 
 /** The frames of the connection itself: its liveness, its watches and its role. */
-type ConnectionFrame = "ping" | "watch" | "unwatch" | "role";
+type ConnectionFrame = "ping" | "watch" | "unwatch" | "role" | "machine-events";
 
-export function createSocket({ clients, present, stopped, admit, setRole, watchable, watchPane, unwatchPane, end, holdPending, attachments, clientSnapshot, herdrLifetime, browserSnapshot, countVisit, drainOutput, frames }: {
+export function createSocket({ clients, present, stopped, admit, setRole, watchable, terminalHistory, watchPane, unwatchPane, end, holdPending, attachments, clientSnapshot, herdrLifetime, browserSnapshot, countVisit, drainOutput, frames }: {
   clients: Set<Client>;
   present: Set<Client>;
   stopped: () => boolean;
@@ -40,6 +40,8 @@ export function createSocket({ clients, present, stopped, admit, setRole, watcha
    * --observe` streams a terminal at its own size, which a release hands to the Herdr app's window)
    */
   watchable: () => boolean;
+  /** whether attaches replay the pane's scrollback for the client to keep (`terminal-history`) */
+  terminalHistory: () => boolean;
   watchPane: (client: Client, paneId: string, geometry: { cols: number; rows: number }) => void;
   unwatchPane: (client: Client, paneId: string) => void;
   end: (client: Client, reason: "closed") => void;
@@ -59,6 +61,13 @@ export function createSocket({ clients, present, stopped, admit, setRole, watcha
   // Here and not in connections.ts: watch checks its grid with validGeometry (terminals.ts), and
   // terminals.ts imports connections.ts, which imports none of the core.
   const connectionFrames = {
+    "machine-events"(client: Client, message: Frame<"machine-events">): void {
+      if (typeof message.enabled !== "boolean") {
+        send(client, { type: "error", code: "invalid_subscription", message: "enabled must be a boolean" });
+        return;
+      }
+      setMachineEvents(client, message.enabled);
+    },
     // liveness only: any role, no herdr call, nothing to wait behind
     ping(client: Client, message: Frame<"ping">): void {
       if (!Number.isSafeInteger(message.id)) {
@@ -127,7 +136,9 @@ export function createSocket({ clients, present, stopped, admit, setRole, watcha
       // The herdr it names lets a page that already knows that herdr send before the snapshot proves it
       const lifetime = herdrLifetime();
       // without "watch" a tab out of use stays attached or pauses, and a reconnect attaches at once
-      const features = watchable() ? SERVER_FEATURES : SERVER_FEATURES.filter((feature) => feature !== "watch");
+      const features: ServerFeature[] = watchable() ? [...SERVER_FEATURES] : SERVER_FEATURES.filter((feature) => feature !== "watch");
+      if (terminalHistory()) features.push("terminal-history");
+      if (client.data.machineEvents) features.push("machine-events");
       send(client, { type: "features", features, connection: client.data.connectionId, ...(lifetime === undefined ? {} : { herdr_lifetime: lifetime }) });
       const snapshot = clientSnapshot();
       countVisit(snapshot, { surface: client.data.surface, ingress: client.data.ingress });

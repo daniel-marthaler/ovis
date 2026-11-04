@@ -12,6 +12,11 @@ bun run dev      # Vite on :5173, proxies /api and /ws
 
 `bun run server` and `bun run dev` never update themselves; only `bun run start` and the plugin run the update supervisor.
 
+For a loopback-only server, `HOST=127.0.0.1 OVIS_IPV6_LOOPBACK=1 bun run server` also listens on
+`::1` at the same port. Both listeners share the API and WebSocket services; `localhost`,
+`127.0.0.1` and `[::1]` keep their own URLs and browser storage. This option does not change a
+non-loopback bind and requires IPv6 loopback to be available.
+
 The plugin's `start` and `stop` (`scripts/plugin.ts`) take turns through `lifecycle.lock` in the
 plugin's state directory (the owner lock of `server/owner-guard.ts`, taken over once its owner is
 proved gone): a start holds it until its server answers or the start fails, a stop until the server
@@ -70,6 +75,35 @@ is one 101 completion; its handshake carries the same response headers, and the 
 still returns `undefined`. Ordinary responses carry the server ID too. The default
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` fill absent headers only,
 preserving each route's CSP, framing, MIME, caching and compression headers.
+
+## Machine event transport and rollback
+
+New browser clients subscribe to `machine-events` on the existing local `/ws` connection when
+its `features` frame advertises that capability. The `machine-event` frames carry the same
+machine roster, redacted sidebar values, shared preferences, seen finishes and filtered device
+pairings as `/api/machines/events`. The local connection is kept even while a remote PC is
+selected; remote terminal sockets do not subscribe to this document.
+
+Older servers still use SSE. Set `OVIS_MACHINE_EVENTS_WS=0` in the server environment and restart
+only Ovis to disable the capability and return new clients to SSE without changing stored data.
+Removing that override and restarting restores the WebSocket transport. The SSE endpoint remains
+available to older clients and bridge/relay consumers. A reconnect negotiates the transport again;
+no terminal input is replayed by this subscription.
+
+A page takes machine events over SSE whenever its socket does not carry them: a connection that
+has not said whether it does within five seconds, a socket stopped for output (4008, which only
+reconnects on an attach), or a connection whose server sent `machine-events-ended`. Machine events
+never close the terminal or stall its output: one that would put more than `OUTPUT_LOW_BYTES`
+(64 KiB) on the socket, counting what is queued already, ends the subscription with that frame
+instead. A roster carries every PC's snapshot, so a page whose roster is larger than that takes
+machine events over SSE, one stream per tab as before this transport. The next connection that offers the capability takes over
+from SSE again.
+
+This avoids consuming one long-lived HTTP/1.1 request per browser tab. It does not make every tab
+share its rendered conversation, terminal or JavaScript heap, and is not a claim of a measured RAM
+reduction. Compare the same pages, conversation sizes and activity before claiming one. In
+particular, the conversation cache's byte budget is an upper bound on retained serialized answers,
+not a measurement of a tab's resident memory or its parsed objects and rendered nodes.
 
 ## Checks
 
@@ -193,13 +227,14 @@ bun scripts/agent-entry-points-demo-regression.ts # Add another agent… in New 
 bun scripts/interface-font-demo-regression.ts # Interface font at 390 and 1440: System and a typed list lead --font-ui, a reload keeps it, Default restores it; the message box takes the Chat font
 bun scripts/theme-first-paint-demo-regression.ts # the saved theme in every painted frame before and after the app starts, root and demo builds under the app's CSP
 bun scripts/boot-loading-demo-regression.ts # index.html's loading spinner while the app's script is held, as on a slow link: centred, stepped, still under reduced motion, gone with the app's first frame (#2329)
-bun scripts/old-safari-demo-regression.ts # a chat pane and a terminal pane draw with the built-ins iOS 16 lacks (Promise.withResolvers, AbortSignal.any, and crypto.randomUUID on plain http) taken away before the app's script runs, under the app's CSP (#2513)
+bun scripts/old-safari-demo-regression.ts # a chat pane and a terminal pane draw with the built-ins iOS 16 lacks (Promise.withResolvers, AbortSignal.any, and crypto.randomUUID on plain http) taken away before the app's script runs, under the app's CSP (#2513), and again with each lookbehind handed to RegExp as text refused, as Safari before 16.4 refuses it; the build turns every regular expression with one into such a call (#2534)
 bun scripts/push-health-demo-regression.ts # the alerts health notice with a stand-in PushManager: a retired subscription told once over the pane and in Settings, repaired once; a refusal, a key mismatch, denied, unsupported, offline, loading and a watching device's refused test, at 390 and 1440, light and dark, Korean at 390
 bun scripts/device-security-demo-regression.ts # Phone & devices on demo fixtures: revoking every device (the caller's warning, the confirmation, a refused write, a watching device) and the line every window gets when a device pairs
 bun scripts/chat-browser-qa.ts  # chat lens end to end
 bun scripts/omo-plan-browser-regression.ts # OmO todo progress and plan panel on isolated native fixtures
 bun scripts/pane-input-focus-demo-regression.ts # the input focus shortcut against fictional panes
 bun scripts/mirror-scroll-demo-regression.ts # fixed mirror wheel/touch, native history, no guessed program input, observe guards
+bun scripts/core-history-scroll-demo-regression.ts # a herdr-core server's history kept in xterm: wheel and swipe scroll it, a replay erases the last one, nothing typed; herdr's own keeps none (#2663)
 bun scripts/mirror-fold-demo-regression.ts # a mirror, or an attached pane a phone watches at a wider grid, folded whole (portrait, landscape), Original width from the pane menu, driving phones and desktops unfolded
 bun scripts/shortcut-exact-modifiers-demo-regression.ts # recording exact-modifier chords: confirm, refusals, dispatch
 bun scripts/output-browser-qa.ts # terminal output flow control end to end
@@ -218,7 +253,7 @@ after a herdr restart. It prints the time each step took. `KEEP=1` leaves the co
 
 Tests run against a herdr session of their own, `ovis-test`. The first run starts a headless `herdr --session ovis-test server` and later runs reuse it, so test workspaces never show in the herdr you work in (`scripts/test-herdr.ts`). Stop it with `herdr --session ovis-test server stop`. `HERDR_TEST_SESSION` picks another name, and `HERDR_TEST_LIVE=1` runs against `HERDR_SOCKET` or your default session instead.
 
-Browser checks launch `CHROME_PATH` when it is set, else Google Chrome at `/opt/google/chrome/chrome` where that exists, else the lockfile's Playwright Chromium (`scripts/chrome-path.ts`; install it with `bun node_modules/playwright-core/cli.js install chromium`). After a herdr upgrade, refresh the generated wire types with `bun run generate:types --refresh` (and `--check` to verify).
+Browser checks launch `CHROME_PATH` when it is set, else Google Chrome at `/opt/google/chrome/chrome` where that exists, else the lockfile's Playwright Chromium (`scripts/chrome-path.ts`; install it with `bun node_modules/playwright-core/cli.js install chromium`). After a herdr upgrade, refresh the generated wire types with `bun run generate:types --refresh` (and `--check` to verify). When ci.yml's `herdr-core-live` job pins a new `HC_VERSION`, refresh herdr-core's with `OVIS_HC_BIN=<that hc> bun run generate:types --refresh-hc`: the live job fails while the snapshot differs from what that hc's `hc schema` prints.
 
 `HEADED=1 bun scripts/chat-browser-qa.ts` opens its owned native-transcript fixture in a
 visible Chrome window. Its detected Codex fixture process keeps the rollout open; no
@@ -235,12 +270,13 @@ bun scripts/droplet-demo-regression.ts        # real-app alerts below the header
 bun scripts/chat-greeting-demo-regression.ts  # an empty chat's greeting: centred on a desktop, docked on a phone
 bun scripts/reply-comments-demo-regression.ts # comments on a reply (#511): the floating Comment moves nothing, one chip, the next message carries them for an agent alone, a slash command leaves them; 1280 and 390, Codex palette in UI_EVIDENCE_DIR
 bun scripts/chat-select-quote-demo-regression.ts # Quote on a chat selection: Quote first and Comment second, the words go in the message box as a `> ` quote after the draft, it takes the keyboard, quotes stack, nothing is sent until Send, then for an agent alone; 1280 and 390, Codex palette in UI_EVIDENCE_DIR
+bun scripts/chat-selection-turn-end-demo-regression.ts # a selection in progress while the agent's turn ends under it (#2650): a bare press and a drag at 1280 and a standing touch selection at 390, in a later reply and in the ending turn below its folding work, keep the words still in every painted frame and take exactly them; the chat is back at its end once the selection goes
 bun scripts/chat-quote-selection-end-regression.ts # Quote and Comment on a triple-click and a drag past a reply's last word (Claude and Codex), quoting the words alone; a selection from a user message or another reply still offers nothing; 1280 and 390
 bun scripts/diff-line-notes-demo-regression.ts # a note on a diff line (#1603): hover +, arrow keys and Enter, a tap and a 44px Add a note; it waits with the reply comments and goes first in the next message for an agent alone; too long is refused; no agent says why; 1280 and 390, Korean, Codex palette in UI_EVIDENCE_DIR
 bun scripts/composer-fit-demo-regression.ts   # one Send/Stop control, pending Send now actions, context/label fit and Chat font sizing
 bun scripts/plan-chip-demo-regression.ts      # the plan chip's step in progress: one row at 390 and 1440, cut when long, with tasks, the list's read states, offline and in a split, Korean too
 bun scripts/held-rows-demo-regression.ts      # held messages: the fold under an approval card, its button, a row's error
-bun scripts/chat-working-line-demo-regression.ts # the Working head: none before a working pane's first read, none under an answer drawn 300 ms before the pane rests, and a finished turn not reopened when the agent begins another by itself
+bun scripts/chat-working-line-demo-regression.ts # the Working head: none before a working pane's first read, none under an answer drawn 300 ms or 1.5 s before the pane rests or read in with the last answer's start time or drawn while blocked, and a finished turn not reopened when the agent begins another by itself
 bun scripts/sidebar-activity-demo-regression.ts # Agents order Activity and pins: blocked pinned, recency, Pin agent / Unpin agent and Pin workspace / Unpin workspace from a right-click and the context-menu key, the ⋯ on a phone, and a finish opened here drawn as ready until the next one
 bun scripts/hide-pc-demo-regression.ts       # Remote PCs → Show in sidebar at 390 and 1440 on two demo PCs: a hidden PC leaves the sidebar, Agents and palette, the selection moves, the last PC stays, a reload keeps it, its link still opens, the sidebar's note shows it again
 bun scripts/sidebar-filter-demo-regression.ts # the roster's label filter on two demo PCs: fuzzy matches with their ancestors, the selection kept as context, pins and folds untouched, a live and an offline roster, the drawer and a reload clearing it; screenshots at 390 and 1440 in UI_EVIDENCE_DIR
@@ -316,7 +352,9 @@ their progress and hide older sessions; ordinary Pi headers are only a few hundr
 A file whose header is not yet complete has no row yet, never a
 guessed identity. Files completed in that first chunk publish their EOF-checked labels immediately.
 The subsequent full label scans share a two-second deadline measured from before the header pass,
-including all queue time. Tests may lengthen both phase deadlines with `piSessionDeadlineMs`.
+including all queue time. When the header pass leaves less than a quarter of that deadline, the
+label scans still get a quarter of it, so a slow disk fills labels over later opens instead of
+never. Tests may lengthen both phase deadlines with `piSessionDeadlineMs`.
 No full scan begins or continues past its deadline. Concurrent listings keep
 independent deadlines, even when reading the same transcript.
 Only clipped metadata and a bounded record projection are retained during a scan. A size and
@@ -914,8 +952,9 @@ The [CI workflow](../.github/workflows/ci.yml) runs on every PR and `main` push:
     process, server and fixture panes. Those helpers stay sequential within their own fixture.
     The context suite prints each helper's elapsed time and stops its owned daemon on exit.
     `bun run test:ui` also runs both suites.
-  - **Browser regression (other scripts)** runs every other browser script, four at a time
-    on hosted CI and six at a time on self-hosted CI.
+  - **Browser regression (other scripts)** runs every other browser script: six at a time in
+    one job on self-hosted CI, and on hosted CI split over four jobs (`BROWSER_SHARD=k/4`,
+    balanced by `scripts/ci-browser-timings.json`) that run three at a time each.
 
   Both browser jobs run `scripts/ci-browser-parallel.ts`, which takes its script list from
   `scripts/ci-browser.sh` (`BROWSER_SCRIPTS` picks from it, `BROWSER_EXCLUDE` leaves scripts out,
@@ -995,9 +1034,11 @@ pages or credentials.
 
 ### Self-hosted runner
 
-`ci.yml`'s Linux jobs of a push or a same-repository pull request run on the maintainer PC's runners
-(labels `["self-hosted","self-hosted-ovis"]`) by default; other events stay on `ubuntu-24.04`. The repository variable `CI_SELF_HOSTED_LABELS`
-overrides that with another JSON array of runner labels that contains `"self-hosted"`, or with the
+`ci.yml`'s Linux jobs of a push run on the maintainer PC's runners (labels
+`["self-hosted","self-hosted-ovis"]`) by default; other events, pull requests included, stay on
+`ubuntu-24.04`, so a pull request's timing-sensitive browser checks do not share that PC's CPU with
+the agents working there. The repository variable `CI_SELF_HOSTED_LABELS` overrides that (labels
+send same-repository pull requests back to the self-hosted runners) with another JSON array of runner labels that contains `"self-hosted"`, or with the
 JSON string `"ubuntu-24.04"` to keep every job GitHub-hosted while that PC is offline. `pages.yml`
 and `release.yml` stay on `ubuntu-24.04` unless the variable holds labels. The variable routes:
 

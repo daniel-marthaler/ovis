@@ -24,6 +24,8 @@ import { RELAY_KO } from "./i18n/relay.ko.ts";
  * braces keep their English names.
  */
 const BASE: Record<string, string> = {
+  "Remove": "제거",
+  "Remove {name}": "{name} 제거",
   "Save": "저장",
   "Goal": "목표",
   "Waiting for your answer": "답변을 기다리는 중",
@@ -85,6 +87,7 @@ const BASE: Record<string, string> = {
   "soon": "준비 중",
   "Terminal": "터미널",
   "herdr {version} · protocol {protocol}": "herdr {version} · 프로토콜 {protocol}",
+  "herdr-core {version} · protocol {protocol}": "herdr-core {version} · 프로토콜 {protocol}",
   "live": "연결됨",
   "disconnected": "끊김",
   "reconnecting": "재연결 중",
@@ -92,7 +95,10 @@ const BASE: Record<string, string> = {
   "herdr offline": "herdr 꺼짐",
   "Status unknown": "상태 알 수 없음",
   "herdr unavailable": "herdr 응답 없음",
+  "Open the Herdr app on this PC, or check HC_SESSION and HC_SOCKET.": "이 PC에서 Herdr 앱을 열거나 HC_SESSION과 HC_SOCKET을 확인하세요.",
+  "herdr-core unavailable": "herdr-core 사용 불가",
   "The last health check failed. Last seen: herdr {version} · protocol {protocol}": "마지막 상태 확인에 실패했습니다. 마지막으로 확인한 상태: herdr {version} · 프로토콜 {protocol}",
+  "The last health check failed. Last seen: herdr-core {version} · protocol {protocol}": "마지막 상태 확인에 실패했습니다. 마지막으로 확인한 상태: herdr-core {version} · 프로토콜 {protocol}",
   "The health check failed": "상태 확인에 실패했습니다",
   "Start herdr on this PC, or check HERDR_SOCKET.": "이 PC에서 herdr를 시작하거나 HERDR_SOCKET을 확인하세요.",
   "The other PC's answer was larger than this app accepts": "다른 PC의 응답이 이 앱이 받을 수 있는 크기보다 큽니다",
@@ -278,6 +284,8 @@ const BASE: Record<string, string> = {
   "{n} background task": "백그라운드 작업 {n}개",
   "{n} background tasks": "백그라운드 작업 {n}개",
   "Try again": "다시 시도",
+  "The relay did not start: {message}": "릴레이를 시작하지 못했습니다: {message}",
+  "Turning on the relay closes the device gate: a new browser then needs a pairing code or the access token.": "릴레이를 켜면 기기 게이트가 닫힙니다. 그 뒤 새 브라우저는 페어링 코드나 접속 토큰이 필요합니다.",
   // tabs: the strip over the pane, and the New tab dialog
   "New tab": "새 탭",
   "Rename tab": "탭 이름 바꾸기",
@@ -331,6 +339,7 @@ const BASE: Record<string, string> = {
   "Weekly": "주간",
   "Open terminal": "터미널 열기",
   "Sign in to {agent}": "{agent}에 로그인",
+  "differs": "다름",
 };
 
 /** The parts KO is made of; src/lib/i18n.test.ts fails when a key is in two parts, since a spread keeps only the last. */

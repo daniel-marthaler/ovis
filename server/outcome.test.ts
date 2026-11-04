@@ -157,6 +157,14 @@ describe("evidence-only command outcomes", () => {
     expect(outcome(sent, { now: at + 2_000, transcript: started }).state).toBe("accepted");
     expect(outcome(sent, { now: at + 41_000, transcript: ended })).toMatchObject({ state: "result-observed", evidence: [{ kind: "transcript", at: new Date(at + 40_000).toISOString() }] });
   });
+  it("does not call a queued Claude /compact done on an automatic compaction", () => {
+    const line = (entry: object, ms: number) => JSON.stringify({ ...entry, timestamp: new Date(at + ms).toISOString() });
+    const boundary = (trigger: string) => line({ type: "system", subtype: "compact_boundary", content: "Conversation compacted", compactMetadata: { trigger, preTokens: 160_000 } }, 30_000);
+    const summary = line({ type: "user", isCompactSummary: true, message: { role: "user", content: "This session is being continued from a previous conversation." } }, 30_000);
+    const sent = send("/compact", "claude", [row("compact")]);
+    expect(outcome(sent, { now: at + 31_000, transcript: [boundary("auto"), summary].join("\n") }).state).toBe("accepted");
+    expect(outcome(sent, { now: at + 31_000, transcript: [boundary("manual"), summary].join("\n") }).state).toBe("result-observed");
+  });
 });
 
 it("serves bounded outcomes, strips observer previews, and records only a successful card commit", async () => {
@@ -372,6 +380,8 @@ it("correlates Pi's thinking card and session-only commit with bare /thinking, n
   const pane = {
     pane_id: "fixture", workspace_id: "w", tab_id: "t", terminal_id: "fixture-terminal",
     focused: false, revision: 0, agent: "pi", agent_status: "idle", status: "idle", screen: "Ready",
+    // pi holds the pane's input: its cards answer only then
+    pid: 2147483646, argv: ["pi"],
   };
   await withFakeHerdr(pane, async (paneId, keys) => {
     const catalog = ["thinking", "model"].map((name) => ({ ...row(name), forms: piSource.forms?.[name] }));
