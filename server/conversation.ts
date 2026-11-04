@@ -1744,9 +1744,9 @@ async function resolveTranscript(pane: HerdrPane, cwd: string, codexHome?: strin
       const resolved = await hermesTranscriptForPane(pane, cwd, hermesHome);
       return { source: "hermes-transcript", path: resolved.dbPath, sessionId: resolved.sessionId };
     }
-    // Kimi Code's store derives from the process's own cwd more often than the pane's shell directory.
-    if (agent === "kimi" || agent === "kimi-code") {
-      const path = await kimiTranscriptPathForPane(pane, cwd);
+    // Kimi's label, not a report an earlier agent left behind: the binding needs a process the pane owns
+    if ((agent === "kimi" || agent === "kimi-code") && pane.agent === "kimi") {
+      const path = await kimiTranscriptPathForPane(pane);
       if (path === null) throw new ConversationUnavailable("no_session_path");
       return { source: "kimi-transcript", path };
     }
@@ -3317,6 +3317,13 @@ function outputInText(source: RecognizedConversation["source"], text: string, re
     } else if (source === "codex-transcript") {
       const payload = entry.payload as { type?: unknown; call_id?: unknown; output?: unknown } | undefined;
       if ((payload?.type === "function_call_output" || payload?.type === "custom_tool_call_output") && payload.call_id === ref) output = codexOutputText(payload.output);
+    } else if (source === "kimi-transcript") {
+      // a result answers the call by Kimi's own toolCallId; the call's own line names it too, results only
+      const event = (entry as { type?: unknown; event?: { type?: unknown; toolCallId?: unknown; result?: { output?: unknown } } }).event;
+      if (entry.type === "context.append_loop_event" && event?.type === "tool.result" && event.toolCallId === ref) {
+        const result = event.result?.output;
+        output = typeof result === "string" ? result : JSON.stringify(result ?? "");
+      }
     } else {
       const message = piMessage(entry);
       if (message) output = piResults(message).find((result) => result.id === ref)?.text ?? null;

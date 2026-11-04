@@ -2,7 +2,8 @@ import { expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { kimiSessionsDir, kimiTranscriptPath, kimiTranscriptPathNearStart, kimiUserText, parseKimiTranscript } from "./kimi.ts";
+import { kimiSessionIdsByPid, kimiSessionsDir, kimiUserText, parseKimiTranscript } from "./kimi.ts";
+import { TOOL_OUTPUT_CHARS } from "./tool-output.ts";
 import { turnStarts } from "./transcript-turns.ts";
 
 it("derives the session directory the way Kimi Code does", () => {
@@ -17,45 +18,6 @@ function fakeSession(home: string, cwd: string, session: string, mtime: Date, cr
   utimesSync(path, mtime, mtime);
   return path;
 }
-
-it("with a pane start time, picks the newest session started at or before it", () => {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-store-")));
-  try {
-    const older = fakeSession(home, "/home/mad", "session_11111111-1111-1111-1111-111111111111", new Date("2026-11-01T10:00:00Z"), Date.parse("2026-11-01T09:00:00Z"));
-    const newer = fakeSession(home, "/home/mad", "session_22222222-2222-2222-2222-222222222222", new Date("2026-11-02T10:00:00Z"), Date.parse("2026-11-02T09:00:00Z"));
-    // a pane up since Nov 1 noon can only have started the older session
-    expect(kimiTranscriptPath("/home/mad", home, Date.parse("2026-11-01T12:00:00Z"))).toBe(older);
-    // a pane that started later may have started either; the newer one wins
-    expect(kimiTranscriptPath("/home/mad", home, Date.parse("2026-11-03T12:00:00Z"))).toBe(newer);
-    // without a start time the newest mtime stands in
-    expect(kimiTranscriptPath("/home/mad", home)).toBe(newer);
-  } finally { rmSync(home, { recursive: true, force: true }); }
-});
-
-it("near-start picks the session a process created seconds before it started", async () => {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-near-")));
-  try {
-    const resumed = fakeSession(home, "/home/mad", "session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", new Date("2026-11-01T10:00:00Z"), Date.parse("2026-10-30T08:00:00Z"));
-    const own = fakeSession(home, "/home/mad", "session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", new Date("2026-11-01T12:00:00Z"), Date.parse("2026-11-01T09:58:40Z"));
-    const start = Date.parse("2026-11-01T09:59:00Z");
-    // the session made 20 s before the process started wins over the older resumed one
-    expect(kimiTranscriptPathNearStart("/home/mad", start, home)).toBe(own);
-    expect(kimiTranscriptPathNearStart("/home/mad", start, home)).not.toBe(resumed);
-    // a process far younger than every session names none: resumption says nothing by time
-    expect(kimiTranscriptPathNearStart("/home/mad", Date.parse("2026-11-02T09:59:00Z"), home)).toBeNull();
-  } finally { rmSync(home, { recursive: true, force: true }); }
-});
-
-it("returns null without a store and the newest session when there are several", () => {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-store-")));
-  try {
-    expect(kimiTranscriptPath("/home/mad", home)).toBeNull();
-    const older = fakeSession(home, "/home/mad", "session_11111111-1111-1111-1111-111111111111", new Date("2026-11-01T10:00:00Z"));
-    const newer = fakeSession(home, "/home/mad", "session_22222222-2222-2222-2222-222222222222", new Date("2026-11-02T10:00:00Z"));
-    expect(kimiTranscriptPath("/home/mad", home)).toBe(newer);
-    expect(kimiTranscriptPath("/home/mad", home)).not.toBe(older);
-  } finally { rmSync(home, { recursive: true, force: true }); }
-});
 
 it("reads a user message from parts or a plain string", () => {
   expect(kimiUserText("Hallo")).toBe("Hallo");
@@ -160,4 +122,47 @@ it("lock files map a pid to its own session, the index maps it to the wire log",
     rmSync(join(home, ".kimi-code", "session_index.jsonl"));
     expect(kimiWireForSessionId("session_cccccccc-cccc-cccc-cccc-cccccccccccc", home)).toBe(wire);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+it("a pid two locks claim is mapped by the newest lock, not a stale one", () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-locks-")));
+  try {
+    const locksDir = join(home, ".kimi-code", "locks", "sessions");
+    mkdirSync(locksDir, { recursive: true });
+    const stale = join(locksDir, "session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.lock");
+    const live = join(locksDir, "session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.lock");
+    writeFileSync(stale, JSON.stringify({ version: 1, pid: 4242 }));
+    writeFileSync(live, JSON.stringify({ version: 1, pid: 4242 }));
+    utimesSync(stale, new Date("2026-10-30T08:00:00Z"), new Date("2026-10-30T08:00:00Z"));
+    utimesSync(live, new Date("2026-11-04T08:00:00Z"), new Date("2026-11-04T08:00:00Z"));
+    expect(kimiSessionIdsByPid(home).get(4242)).toBe("session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+it("cuts a long tool result like the other readers, whole output kept behind the toolCallId", () => {
+  const long = "x".repeat(TOOL_OUTPUT_CHARS * 3);
+  const wire = [
+    { type: "context.append_loop_event", event: { type: "tool.call", toolCallId: "tool_big", name: "Bash", args: { command: "big" } } },
+    { type: "context.append_loop_event", event: { type: "tool.result", toolCallId: "tool_big", result: { output: long } } },
+    { type: "context.append_loop_event", event: { type: "tool.call", toolCallId: "tool_small", name: "Bash", args: { command: "small" } } },
+    { type: "context.append_loop_event", event: { type: "tool.result", toolCallId: "tool_small", result: { output: "ok" } } },
+  ].map((record) => JSON.stringify(record)).join("\n");
+  const tools = parseKimiTranscript(wire).flatMap((turn) => turn.parts).filter((part) => part.kind === "tool");
+  expect(tools.map((tool) => [tool.output_ref, tool.output_size])).toEqual([["tool_big", long.length], [undefined, undefined]]);
+  expect(tools[0]!.output.endsWith("… trimmed")).toBe(true);
+  expect(tools[1]).toMatchObject({ output: "ok", state: "ok" });
+});
+
+it("skips a null record and a wild timestamp instead of failing the page", () => {
+  const wire = [
+    "null",
+    JSON.stringify({ type: "context.append_loop_event", event: { type: "content.part", part: { type: "text", text: "vorher" } }, time: 9e18 }),
+    JSON.stringify({ type: "context.append_message", message: { role: "user", content: "hi" } }),
+    JSON.stringify({ type: "context.append_loop_event", event: { type: "content.part", part: { type: "text", text: "Antwort" } }, time: 1793439036000 }),
+  ].join("\n");
+  const turns = parseKimiTranscript(wire);
+  expect(turns).toHaveLength(3);
+  expect(turns[0]).toEqual({ role: "assistant", ts: null, parts: [{ kind: "text", text: "vorher" }] });
+  expect(turns[1]!.parts).toEqual([{ kind: "text", text: "hi" }]);
+  expect(turns[2]).toEqual({ role: "assistant", ts: new Date(1793439036000).toISOString(), parts: [{ kind: "text", text: "Antwort" }] });
 });

@@ -1,7 +1,13 @@
 /**
  * Kimi Code keeps one append-only wire log per agent session:
- * `~/.kimi-code/sessions/wd_<dir-name>_<sha256(cwd)[:12]>/<session>/agents/<agent>/wire.jsonl`.
+ * `~/.kimi-code/sessions/wd_<dir>_<sha256(cwd)[:12]>/<session>/agents/<agent>/wire.jsonl`.
  * This file reads that log into conversation turns for the chat view.
+ *
+ * The pane's session is proven, never guessed: the log file a process of the pane's own
+ * process tree holds open (Linux /proc), else the session id a live lock file names for
+ * one of the pane's processes (`~/.kimi-code/locks/sessions/<id>.lock`, written by the
+ * CLI itself, on every OS). With no such proof the chat falls back to the terminal —
+ * no picking by creation time or newest mtime, on any OS.
  */
 import { createHash } from "node:crypto";
 import { opendirSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
@@ -10,6 +16,7 @@ import { basename, join } from "node:path";
 import type { ConversationPart, ConversationTurn } from "../shared/protocol.ts";
 import type { HerdrPane } from "../shared/protocol.ts";
 import { paneProcessInfo } from "./herdr/client.ts";
+import { trimOutput } from "./tool-output.ts";
 
 /** The store directory Kimi Code derives from a working directory. */
 export function kimiSessionsDir(cwd: string, home = homedir()): string {
@@ -56,17 +63,24 @@ function processTree(rootPid: number): number[] {
 
 /** The session ids a pid owns, from the CLI's own lock files (written with a live heartbeat). */
 export function kimiSessionIdsByPid(home = homedir()): Map<number, string> {
-  const map = new Map<number, string>();
+  const map = new Map<number, { sessionId: string; mtimeMs: number }>();
   let names: string[];
-  try { names = readdirSync(join(home, ".kimi-code", "locks", "sessions")); } catch { return map; }
+  try { names = readdirSync(join(home, ".kimi-code", "locks", "sessions")); } catch { return new Map(); }
   for (const name of names) {
     if (!name.endsWith(".lock")) continue;
-    try {
-      const lock = JSON.parse(readFileSync(join(home, ".kimi-code", "locks", "sessions", name), "utf8")) as { pid?: unknown };
-      if (Number.isSafeInteger(lock.pid) && (lock.pid as number) > 1) map.set(lock.pid as number, name.slice(0, -".lock".length));
-    } catch { /* a lock half-written: the next read has it whole */ }
+    const path = join(home, ".kimi-code", "locks", "sessions", name);
+    let lock: { pid?: unknown };
+    try { lock = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown }; } catch { continue; }
+    const pid = lock.pid;
+    if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 1) continue;
+    let mtimeMs: number;
+    try { mtimeMs = statSync(path).mtimeMs; } catch { continue; }
+    // a pid a stale lock shares with a live one says nothing: the newest lock wins
+    const known = map.get(pid);
+    if (known !== undefined && known.mtimeMs >= mtimeMs) continue;
+    map.set(pid, { sessionId: name.slice(0, -".lock".length), mtimeMs });
   }
-  return map;
+  return new Map([...map].map(([pid, entry]) => [pid, entry.sessionId]));
 }
 
 /** The main agent's wire log of the session with this id, via the index, else by scanning the stores. */
@@ -104,79 +118,7 @@ export async function kimiPathFromProcessTree(paneId: string): Promise<string | 
   return held.size === 1 ? [...held][0]! : null;
 }
 
-/** The session's own creation time from its metadata record (first line), null when unreadable. */
-function kimiWireCreatedAt(path: string): number | null {
-  let head: string;
-  try { head = readFileSync(path, "utf8").slice(0, 65536); } catch { return null; }
-  const newline = head.indexOf("\n");
-  if (newline === -1) return null;
-  try {
-    const record = JSON.parse(head.slice(0, newline)) as { type?: unknown; created_at?: unknown };
-    return record.type === "metadata" && typeof record.created_at === "number" ? record.created_at : null;
-  } catch { return null; }
-}
-
-/**
- * The session a pane started in `cwd`, or null when Kimi Code never wrote one there.
- * With `startedAtMs` (the pane shell's start), the newest session created at or before it wins —
- * a pane keeps its own session even after another pane in the same cwd wrote a newer one. Without
- * it, the newest mtime stands in. The CLI appends and closes, so the frontend process holds no
- * open file to follow on platforms without /proc.
- */
-export function kimiTranscriptPath(cwd: string, home = homedir(), startedAtMs: number | null = null): string | null {
-  if (typeof cwd !== "string" || cwd.length === 0) return null;
-  const root = kimiSessionsDir(cwd, home);
-  let names: string[];
-  try { names = readdirSync(root); } catch { return null; }
-  let best: { path: string; rank: number } | null = null;
-  for (const name of names) {
-    if (!name.startsWith("session_")) continue;
-    const path = join(root, name, "agents", "main", "wire.jsonl");
-    let rank: number;
-    try {
-      rank = statSync(path).mtimeMs;
-    } catch { continue; /* a session dir without the main agent's log */ }
-    if (startedAtMs !== null) {
-      const createdAt = kimiWireCreatedAt(path);
-      // only sessions the pane could have started; newer ones belong to a later pane
-      if (createdAt === null || createdAt > startedAtMs + 10_000) continue;
-      rank = createdAt;
-    }
-    if (best === null || rank > best.rank) best = { path, rank };
-  }
-  return best?.path ?? null;
-}
-
-/** The shell's start time as the /proc entry's ctime, null when unavailable. */
-function processStartedAtMs(pid: number): number | null {
-  try { return statSync(`/proc/${pid}`).ctimeMs; } catch { return null; }
-}
-
-/**
- * The session created closest before `startedAtMs` (a pane's process starts just before its CLI
- * writes the session's metadata), when that lead is small; null otherwise — a session far older
- * than the process is a resumed one, and time says nothing about which pane resumed it.
- */
-export function kimiTranscriptPathNearStart(cwd: string, startedAtMs: number, home = homedir()): string | null {
-  if (typeof cwd !== "string" || cwd.length === 0) return null;
-  const root = kimiSessionsDir(cwd, home);
-  let names: string[];
-  try { names = readdirSync(root); } catch { return null; }
-  let best: { path: string; lead: number } | null = null;
-  for (const name of names) {
-    if (!name.startsWith("session_")) continue;
-    const path = join(root, name, "agents", "main", "wire.jsonl");
-    try { statSync(path); } catch { continue; }
-    const createdAt = kimiWireCreatedAt(path);
-    if (createdAt === null) continue;
-    const lead = startedAtMs - createdAt;
-    if (lead < -5_000 || lead > 120_000) continue;
-    if (best === null || lead < best.lead) best = { path, lead };
-  }
-  return best?.path ?? null;
-}
-
-const paneResolution = new Map<string, { path: string; at: number; pinned: boolean }>();
+const paneResolution = new Map<string, { path: string | null; at: number; pinned: boolean }>();
 const RESOLVE_TTL_MS = 15_000;
 const PIN_VERIFY_MS = 30_000;
 
@@ -186,14 +128,17 @@ const PIN_VERIFY_MS = 30_000;
  * 1. A file-descriptor match in the pane's process tree. The CLI appends and closes, so the log
  *    is open only in write bursts; the first match therefore pins the pane's session until a
  *    different match replaces it (a /clear in the pane).
- * 2. A session created just before the pane's foreground process started — a new CLI makes its
- *    session within seconds of its own start (this is what separates two panes in one cwd).
- * 3. The newest session started at or before the foreground process, then the shell.
+ * 2. A session lock naming one of the pane's processes (its shell, foreground processes and,
+ *    on Linux, the whole tree below the shell): the CLI writes one lock per live session with
+ *    the owning pid, so this binds on every OS and separates two panes in one directory —
+ *    each owns the session its own process holds.
  *
- * Answers are cached briefly; unpinned entries follow the TTL, a pin is re-verified on its own
- * interval and kept when no fresh fd evidence says otherwise.
+ * Without either proof the answer is null and the chat stays on the terminal; a session found
+ * by any time (creation, mtime) would be another pane's or a finished one. Answers are cached
+ * briefly; unpinned entries follow the TTL, a pin is re-verified on its own interval and kept
+ * when no fresh fd evidence says otherwise.
  */
-export async function kimiTranscriptPathForPane(pane: HerdrPane, cwd: string, home = homedir()): Promise<string | null> {
+export async function kimiTranscriptPathForPane(pane: HerdrPane, home = homedir()): Promise<string | null> {
   const now = Date.now();
   const cached = paneResolution.get(pane.pane_id);
   if (cached !== undefined && (cached.pinned ? now - cached.at < PIN_VERIFY_MS : now - cached.at < RESOLVE_TTL_MS)) return cached.path;
@@ -203,7 +148,6 @@ export async function kimiTranscriptPathForPane(pane: HerdrPane, cwd: string, ho
   if (path !== null) {
     pinned = true;
   } else {
-    // the CLI's lock files name the owner pid of each live session: the strongest steady evidence
     const info = await paneProcessInfo(pane.pane_id).catch(() => null);
     const locks = kimiSessionIdsByPid(home);
     if (locks.size > 0) {
@@ -220,23 +164,8 @@ export async function kimiTranscriptPathForPane(pane: HerdrPane, cwd: string, ho
         if (path !== null) break;
       }
     }
-    const foreground = (info?.foreground_processes ?? [])[0];
-    const fgStart = foreground !== undefined && Number.isSafeInteger(foreground.pid) && foreground.pid > 1 ? processStartedAtMs(foreground.pid) : null;
-    if (path === null && fgStart !== null) {
-      path = kimiTranscriptPathNearStart(cwd, fgStart, home)
-        ?? (typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? kimiTranscriptPathNearStart(pane.foreground_cwd, fgStart, home) : null);
-    }
-    if (path === null) {
-      const shell = info?.shell_pid;
-      const startedAtMs = typeof shell === "number" && Number.isSafeInteger(shell) && shell > 1 ? processStartedAtMs(shell) : null;
-      const cwds = [cwd, typeof pane.foreground_cwd === "string" && pane.foreground_cwd.length > 0 ? pane.foreground_cwd : ""];
-      for (const candidate of cwds) {
-        path = kimiTranscriptPath(candidate, home, startedAtMs);
-        if (path !== null) break;
-      }
-    }
   }
-  paneResolution.set(pane.pane_id, { path: path ?? "", at: now, pinned });
+  paneResolution.set(pane.pane_id, { path, at: now, pinned });
   return path;
 }
 
@@ -247,6 +176,11 @@ export function kimiUserText(content: unknown): string | null {
   const texts = content.filter((part): part is { type: "text"; text: string } =>
     part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string");
   return texts.length === 0 ? null : texts.map((part) => part.text).join("\n");
+}
+
+/** The ISO time of a record's millisecond epoch, null when it is not a sane epoch. */
+function kimiWireTs(time: unknown): string | null {
+  return typeof time === "number" && Number.isSafeInteger(time) && Math.abs(time) <= 8.64e15 ? new Date(time).toISOString() : null;
 }
 
 /** A short rendering of a tool call for the fold: a command is its command line, else its name. */
@@ -265,7 +199,9 @@ type PendingTool = Extract<ConversationPart, { kind: "tool" }> & { state: "pendi
  * (text or think), `tool.call` and its later `tool.result`, all carrying the loop's
  * `time`. Everything between two user prompts is one assistant turn. A stored user
  * message whose `origin.kind` is not "user" (injections, task notifications, cron
- * firings) is meta traffic and never becomes a turn.
+ * firings) is meta traffic and never becomes a turn. A record whose shape is wrong
+ * (a `null` line, a wild timestamp) is skipped, never fails the page; a tool result
+ * is cut like the other readers' (trimOutput), the rest fetched by its toolCallId.
  */
 export function parseKimiTranscript(text: string): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
@@ -290,9 +226,10 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
         toolCallId?: unknown; name?: unknown; args?: unknown; display?: { kind?: unknown; command?: unknown };
         result?: { output?: unknown; error?: unknown };
       };
-    };
+    } | null;
     try { record = JSON.parse(line) as typeof record; } catch { continue; }
-    const ts = typeof record.time === "number" ? new Date(record.time).toISOString() : null;
+    if (record === null || typeof record !== "object") continue;
+    const ts = kimiWireTs(record.time);
     if (record.type === "context.append_message") {
       if (record.message?.role !== "user") continue;
       // The CLI tags every stored message with its origin: only the user's own
@@ -331,7 +268,7 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
       const tool = typeof event.toolCallId === "string" ? pending.get(event.toolCallId) : undefined;
       if (tool === undefined) continue;
       const output = event.result?.output;
-      tool.output = typeof output === "string" ? output : JSON.stringify(output ?? "");
+      trimOutput(tool, typeof output === "string" ? output : JSON.stringify(output ?? ""), event.toolCallId as string);
       tool.state = event.result?.error ? "error" : "ok";
       if (tool.state === "error") tool.error = true;
       pending.delete(event.toolCallId as string);
