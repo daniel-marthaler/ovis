@@ -109,7 +109,8 @@ export function parseConversationMetadata(text: string, source: ConversationResp
     for (const line of text.split("\n")) {
       if (!line.includes('"llm.request"')) continue;
       try {
-        const record = JSON.parse(line) as { model?: unknown; thinkingEffort?: unknown };
+        const record = JSON.parse(line) as { type?: unknown; kind?: unknown; model?: unknown; thinkingEffort?: unknown } | null;
+        if (record === null || record.type !== "llm.request" || record.kind === "compaction") continue;
         if (typeof record.model === "string") metadata.model = record.model;
         if (typeof record.thinkingEffort === "string") metadata.reasoning_effort = record.thinkingEffort;
       } catch { /* a partial line: the next read has it whole */ }

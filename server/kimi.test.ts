@@ -1,30 +1,27 @@
-import { expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, utimesSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { afterEach, expect, it } from "bun:test";
+import { appendFileSync, mkdirSync, mkdtempSync, openSync, closeSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { kimiSessionIdsByPid, kimiSessionsDir, kimiUserText, parseKimiTranscript } from "./kimi.ts";
+import { forgetTranscriptState, transcriptPage } from "./conversation.ts";
+import { kimiWireForProcesses, parseKimiTranscript } from "./kimi.ts";
 import { TOOL_OUTPUT_CHARS } from "./tool-output.ts";
 import { turnStarts } from "./transcript-turns.ts";
 
-it("derives the session directory the way Kimi Code does", () => {
-  expect(kimiSessionsDir("/home/mad", "/home/mad/fake-home")).toBe(
-    "/home/mad/fake-home/.kimi-code/sessions/wd_mad_6c73d0ee67aa");
-});
+const roots: string[] = [];
+afterEach(() => { roots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true })); forgetTranscriptState(); });
+const jsonl = (rows: unknown[]) => rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
 
-function fakeSession(home: string, cwd: string, session: string, mtime: Date, createdAt?: number): string {
-  const path = join(kimiSessionsDir(cwd, home), session, "agents", "main", "wire.jsonl");
-  mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, createdAt !== undefined ? `${JSON.stringify({ type: "metadata", created_at: createdAt })}\n` : "");
-  utimesSync(path, mtime, mtime);
-  return path;
+/** A Kimi home with one session's main wire log per id, under one folder's store. */
+function kimiHome(...sessions: string[]): { home: string; wire: (id: string) => string; lock: (id: string, body: unknown) => void } {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-home-"))); roots.push(home);
+  const wire = (id: string) => join(home, ".kimi-code", "sessions", "wd_work_0123456789ab", id, "agents", "main", "wire.jsonl");
+  for (const id of sessions) { mkdirSync(join(wire(id), ".."), { recursive: true }); writeFileSync(wire(id), ""); }
+  const locks = join(home, ".kimi-code", "locks", "sessions");
+  mkdirSync(locks, { recursive: true });
+  return { home, wire, lock: (id, body) => writeFileSync(join(locks, `${id}.lock`), typeof body === "string" ? body : JSON.stringify(body)) };
 }
-
-it("reads a user message from parts or a plain string", () => {
-  expect(kimiUserText("Hallo")).toBe("Hallo");
-  expect(kimiUserText([{ type: "text", text: "a" }, { type: "text", text: "b" }])).toBe("a\nb");
-  expect(kimiUserText([{ type: "image" }])).toBeNull();
-  expect(kimiUserText(undefined)).toBeNull();
-});
+/** What the CLI writes when this process takes a session. */
+const liveLock = (pid = process.pid) => ({ version: 1, token: `${pid}:x`, pid, hostname: hostname(), startedAt: Date.now(), clientIdentity: "kimi_code_cli" });
 
 const WIRE = [
   { type: "metadata", protocol_version: "1.5", created_at: 1793439028458 },
@@ -104,39 +101,72 @@ it("marks user prompts as turn starts for the transcript scanner", () => {
   expect(bytes.subarray(starts[1]!).toString("utf8")).toContain("Und Tschau");
 });
 
-it("lock files map a pid to its own session, the index maps it to the wire log", async () => {
-  const { kimiSessionIdsByPid, kimiWireForSessionId } = await import("./kimi.ts");
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-locks-")));
-  try {
-    const wire = fakeSession(home, "/home/mad", "session_cccccccc-cccc-cccc-cccc-cccccccccccc", new Date("2026-11-01T10:00:00Z"), Date.parse("2026-11-01T09:00:00Z"));
-    const locksDir = join(home, ".kimi-code", "locks", "sessions");
-    mkdirSync(locksDir, { recursive: true });
-    writeFileSync(join(locksDir, "session_cccccccc-cccc-cccc-cccc-cccccccccccc.lock"), JSON.stringify({ version: 1, pid: 4242 }));
-    const byPid = kimiSessionIdsByPid(home);
-    expect(byPid.get(4242)).toBe("session_cccccccc-cccc-cccc-cccc-cccccccccccc");
-    expect(byPid.get(9999)).toBeUndefined();
-    // via the index
-    writeFileSync(join(home, ".kimi-code", "session_index.jsonl"), `${JSON.stringify({ sessionId: "session_cccccccc-cccc-cccc-cccc-cccccccccccc", sessionDir: join(home, ".kimi-code", "sessions", "wd_mad_6c73d0ee67aa", "session_cccccccc-cccc-cccc-cccc-cccccccccccc"), workDir: "/home/mad" })}\n`);
-    expect(kimiWireForSessionId("session_cccccccc-cccc-cccc-cccc-cccccccccccc", home)).toBe(wire);
-    // without the index, the store scan finds it
-    rmSync(join(home, ".kimi-code", "session_index.jsonl"));
-    expect(kimiWireForSessionId("session_cccccccc-cccc-cccc-cccc-cccccccccccc", home)).toBe(wire);
-  } finally { rmSync(home, { recursive: true, force: true }); }
+it("binds the session a live lock of the pane's own process names, and follows a new one at once", () => {
+  const { home, wire, lock } = kimiHome("session_a", "session_b");
+  lock("session_a", liveLock());
+  expect(kimiWireForProcesses([process.pid], home)).toBe(wire("session_a"));
+  // another pane's process: no binding
+  expect(kimiWireForProcesses([process.pid + 1_000_000], home)).toBeNull();
+  // /new in the pane: the CLI lets go of A and takes B
+  rmSync(join(home, ".kimi-code", "locks", "sessions", "session_a.lock"));
+  lock("session_b", liveLock());
+  expect(kimiWireForProcesses([process.pid], home)).toBe(wire("session_b"));
 });
 
-it("a pid two locks claim is mapped by the newest lock, not a stale one", () => {
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "kimi-locks-")));
+it("ignores a lock a crashed process left behind, another host's and a broken one", () => {
+  const { home, lock } = kimiHome("session_old", "session_far");
+  // written before this pid's process started: a dead process's, its pid since reused
+  lock("session_old", { ...liveLock(), startedAt: 1 });
+  lock("session_far", { ...liveLock(), hostname: `${hostname()}-elsewhere` });
+  lock("session_null", "null");
+  lock("session_junk", "{");
+  expect(kimiWireForProcesses([process.pid], home)).toBeNull();
+});
+
+it("gives no session when the pane's processes hold two", () => {
+  const { home, lock } = kimiHome("session_a", "session_b");
+  lock("session_a", liveLock());
+  lock("session_b", liveLock());
+  expect(kimiWireForProcesses([process.pid], home)).toBeNull();
+});
+
+it.skipIf(process.platform !== "linux")("without a lock, binds the main wire log the process holds open, never a sub-agent's", () => {
+  const { home, wire } = kimiHome("session_m");
+  const sub = join(wire("session_m"), "..", "..", "sub1", "wire.jsonl");
+  mkdirSync(join(sub, ".."), { recursive: true }); writeFileSync(sub, "");
+  const subFd = openSync(sub, "r");
   try {
-    const locksDir = join(home, ".kimi-code", "locks", "sessions");
-    mkdirSync(locksDir, { recursive: true });
-    const stale = join(locksDir, "session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.lock");
-    const live = join(locksDir, "session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.lock");
-    writeFileSync(stale, JSON.stringify({ version: 1, pid: 4242 }));
-    writeFileSync(live, JSON.stringify({ version: 1, pid: 4242 }));
-    utimesSync(stale, new Date("2026-10-30T08:00:00Z"), new Date("2026-10-30T08:00:00Z"));
-    utimesSync(live, new Date("2026-11-04T08:00:00Z"), new Date("2026-11-04T08:00:00Z"));
-    expect(kimiSessionIdsByPid(home).get(4242)).toBe("session_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
-  } finally { rmSync(home, { recursive: true, force: true }); }
+    expect(kimiWireForProcesses([process.pid], home)).toBeNull();
+    const mainFd = openSync(wire("session_m"), "r");
+    try { expect(kimiWireForProcesses([process.pid], home)).toBe(wire("session_m")); } finally { closeSync(mainFd); }
+  } finally { closeSync(subFd); }
+});
+
+it("pages at every prompt the parser shows, an image-only one too", () => {
+  const prompt = (content: unknown) => ({ type: "context.append_message", message: { role: "user", origin: { kind: "user" }, content } });
+  const answer = (text: string) => ({ type: "context.append_loop_event", event: { type: "content.part", part: { type: "text", text } } });
+  const text = jsonl([prompt("first"), answer("one"), prompt([{ type: "image_url", imageUrl: { url: "file:///x.png" } }]), answer("two")]);
+  expect(parseKimiTranscript(text).filter((turn) => turn.role === "user")).toHaveLength(2);
+  expect(turnStarts(Buffer.from(text), "kimi-transcript")).toHaveLength(2);
+});
+
+it("shows the model of the newest request when it lies between the metadata head and the newest page", () => {
+  const { wire } = kimiHome("session_m");
+  const path = wire("session_m");
+  const request = (model: string, kind = "loop") => ({ type: "llm.request", agentId: "main", kind, provider: "kimi", model, thinkingEffort: "high", toolSelect: true, systemPromptHash: "h", toolsHash: "t", messageCount: 1 });
+  const prompt = (text: string) => ({ type: "context.append_message", message: { role: "user", origin: { kind: "user" }, content: text } });
+  writeFileSync(path, jsonl([
+    request("first"), prompt("start"), { type: "padding", text: "x".repeat(70 * 1024) },
+    request("second"), request("summarizer", "compaction"),
+    ...Array.from({ length: 130 }, (_, i) => prompt(`turn ${i}`)),
+  ]));
+  const page = transcriptPage("kimi-transcript", path);
+  expect(page.cursor).toBeString(); // the newest page starts after the request
+  expect(page.metadata).toEqual({ model: "second", reasoning_effort: "high" });
+  forgetTranscriptState();
+  expect(transcriptPage("kimi-transcript", path).metadata).toEqual({ model: "second", reasoning_effort: "high" });
+  appendFileSync(path, jsonl([request("third")]));
+  expect(transcriptPage("kimi-transcript", path).metadata.model).toBe("third");
 });
 
 it("cuts a long tool result like the other readers, whole output kept behind the toolCallId", () => {

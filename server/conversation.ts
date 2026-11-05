@@ -65,7 +65,7 @@ import { museSession, museToolOutput, MuseUnavailable, parseMuseTranscript } fro
 import { resolveMuseSession } from "./muse-store.ts";
 import { LettaUnavailable, lettaToolOutput, parseLettaTranscript } from "./letta.ts";
 import { lettaLocalSettings, resolveLettaTranscript } from "./letta-store.ts";
-import { kimiTranscriptPathForPane, parseKimiTranscript } from "./kimi.ts";
+import { kimiToolOutput, kimiTranscriptPathForPane, parseKimiTranscript } from "./kimi.ts";
 import { withinRetentionBudget } from "./retention-budget.ts";
 import { forgetAllPiIndexes, forgetPiIndex, piAbandonedTurns, piBranchRecords, piBranchSegments } from "./pi-tree.ts";
 import { COPILOT_IMAGE_REF, copilotImage, copilotOffsetOutput, copilotOutput, copilotRootRecord, parseCopilotTranscript } from "./copilot.ts";
@@ -351,7 +351,8 @@ function readStream(stream: TranscriptStream, from: number, to: number): Buffer 
  * changes between the head and newest page are otherwise never read. */
 const SETTING_TYPES = ['"model_change"', '"thinking_level_change"'];
 const COPILOT_SETTING_TYPES = ['"session.model_change"', '"session.resume"'];
-type SettingType = "model_change" | "thinking_level_change" | "copilot_model" | "copilot_effort";
+const KIMI_SETTING_TYPES = ['"llm.request"'];
+type SettingType = "model_change" | "thinking_level_change" | "copilot_model" | "copilot_effort" | "kimi_request";
 /**
  * Claude names its model and effort on every answer, and a /rewind can leave any of them off the
  * branch, so each field keeps every record that set it since the last clear (where it lies, as
@@ -598,7 +599,7 @@ function* applyHistoryBoundarySteps(path: string, stream: TranscriptStream, sour
         // what lies before the /clear is never judged
         if (scan.pictures) scan.pictures = noPictures(base + offset, stream);
       }
-      else if (!skipping && source !== "claude-transcript" && (source === "copilot-transcript" ? COPILOT_SETTING_TYPES : SETTING_TYPES).some((type) => line.includes(type))) {
+      else if (!skipping && source !== "claude-transcript" && (source === "copilot-transcript" ? COPILOT_SETTING_TYPES : source === "kimi-transcript" ? KIMI_SETTING_TYPES : SETTING_TYPES).some((type) => line.includes(type))) {
         try {
           const entry: unknown = JSON.parse(line.toString("utf8"));
           const type = entry !== null && typeof entry === "object" && "type" in entry ? entry.type : null;
@@ -613,6 +614,9 @@ function* applyHistoryBoundarySteps(path: string, stream: TranscriptStream, sour
                 if ("reasoningEffort" in data) scan.settings.copilot_effort = setting;
               }
             }
+          } else if (source === "kimi-transcript") {
+            // Kimi names the model and effort on each request; a compaction's own request is not the chat's
+            if (type === "llm.request" && (entry as { kind?: unknown }).kind !== "compaction") scan.settings.kimi_request = { offset: base + offset, end: base + newline, line: line.toString("utf8") };
           } else if (type === "model_change" || type === "thinking_level_change") {
             scan.settings[type] = { offset: base + offset, end: base + newline, line: line.toString("utf8") };
           }
@@ -3040,6 +3044,7 @@ export function transcriptToolOutput(source: Exclude<StreamSource, "agy-transcri
     return output !== null && output.length > TOOL_OUTPUT_MAX ? `${output.slice(0, TOOL_OUTPUT_MAX)}\n… trimmed` : output;
   }
   if (source === "pi-transcript" || source === "cmd-transcript") return piToolOutput(path, ref);
+  if (source === "kimi-transcript") return kimiToolOutput(path, ref, TOOL_OUTPUT_MAX);
   if (source === "omo-transcript") {
     try {
       const stream = transcriptStream(source, path, statSync(path), codexHome ?? defaultCodexHome());
@@ -3358,13 +3363,6 @@ function outputInText(source: RecognizedConversation["source"], text: string, re
     } else if (source === "codex-transcript") {
       const payload = entry.payload as { type?: unknown; call_id?: unknown; output?: unknown } | undefined;
       if ((payload?.type === "function_call_output" || payload?.type === "custom_tool_call_output") && payload.call_id === ref) output = codexOutputText(payload.output);
-    } else if (source === "kimi-transcript") {
-      // a result answers the call by Kimi's own toolCallId; the call's own line names it too, results only
-      const event = (entry as { type?: unknown; event?: { type?: unknown; toolCallId?: unknown; result?: { output?: unknown } } }).event;
-      if (entry.type === "context.append_loop_event" && event?.type === "tool.result" && event.toolCallId === ref) {
-        const result = event.result?.output;
-        output = typeof result === "string" ? result : JSON.stringify(result ?? "");
-      }
     } else {
       const message = piMessage(entry);
       if (message) output = piResults(message).find((result) => result.id === ref)?.text ?? null;
