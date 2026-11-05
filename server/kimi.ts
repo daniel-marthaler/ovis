@@ -122,7 +122,7 @@ function programOf(pid: number): string | null {
  * locked this one and the folder has started no session since, its last session is still the one
  * it shows.
  */
-const proven = new Map<string, { path: string; pid: number; program: string; at: number }>();
+const proven = new Map<string, { path: string; pid: number; program: string; store: number }>();
 
 /**
  * The wire log these processes own: the session they prove now, else the one the same live program
@@ -133,8 +133,10 @@ export function kimiWireForPane(paneId: string, pids: number[], home = homedir()
   const proof = proveWire(own, home);
   if (typeof proof === "object") {
     const program = programOf(proof.pid);
-    if (program === null) proven.delete(paneId);
-    else proven.set(paneId, { ...proof, program, at: Date.now() });
+    let store: number | null = null;
+    try { store = statSync(dirname(dirname(dirname(dirname(proof.path))))).mtimeMs; } catch { /* gone: nothing to keep */ }
+    if (program === null || store === null) proven.delete(paneId);
+    else proven.set(paneId, { ...proof, program, store });
     return proof.path;
   }
   const last = proven.get(paneId);
@@ -144,7 +146,7 @@ export function kimiWireForPane(paneId: string, pids: number[], home = homedir()
   const session = dirname(dirname(dirname(last.path)));
   try { statSync(join(home, ".kimi-code", "locks", "sessions", `${basename(session)}.lock`)); return null; } catch { /* nobody holds it */ }
   // a session the folder got since (`/new`) may be the one this Kimi has switched to before it writes
-  try { if (statSync(dirname(session)).mtimeMs > last.at) return null; } catch { return null; }
+  try { if (statSync(dirname(session)).mtimeMs !== last.store) return null; } catch { return null; }
   proven.set(paneId, last);
   return last.path;
 }
