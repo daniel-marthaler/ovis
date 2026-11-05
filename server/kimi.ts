@@ -118,10 +118,11 @@ function programOf(pid: number): string | null {
 /**
  * The last session proven for each pane, and the program that held it. The CLI lets go of its lock
  * a few seconds after a turn ends and opens its log only to append, so an idle Kimi proves nothing;
- * while that same program still runs in the pane, holds no other session and no other process has
- * locked this one, its last session is still the one it shows.
+ * while that same program still runs in the pane, holds no other session, no other process has
+ * locked this one and the folder has started no session since, its last session is still the one
+ * it shows.
  */
-const proven = new Map<string, { path: string; pid: number; program: string }>();
+const proven = new Map<string, { path: string; pid: number; program: string; at: number }>();
 
 /**
  * The wire log these processes own: the session they prove now, else the one the same live program
@@ -133,15 +134,17 @@ export function kimiWireForPane(paneId: string, pids: number[], home = homedir()
   if (typeof proof === "object") {
     const program = programOf(proof.pid);
     if (program === null) proven.delete(paneId);
-    else proven.set(paneId, { ...proof, program });
+    else proven.set(paneId, { ...proof, program, at: Date.now() });
     return proof.path;
   }
   const last = proven.get(paneId);
   proven.delete(paneId);
   if (proof !== "none" || last === undefined || !own.has(last.pid) || !processAlive(last.pid) || programOf(last.pid) !== last.program) return null;
   // a lock on this session now is another process's (the pane's own would have proved it)
-  const sessionId = basename(dirname(dirname(dirname(last.path))));
-  try { statSync(join(home, ".kimi-code", "locks", "sessions", `${sessionId}.lock`)); return null; } catch { /* nobody holds it */ }
+  const session = dirname(dirname(dirname(last.path)));
+  try { statSync(join(home, ".kimi-code", "locks", "sessions", `${basename(session)}.lock`)); return null; } catch { /* nobody holds it */ }
+  // a session the folder got since (`/new`) may be the one this Kimi has switched to before it writes
+  try { if (statSync(dirname(session)).mtimeMs > last.at) return null; } catch { return null; }
   proven.set(paneId, last);
   return last.path;
 }
@@ -234,6 +237,14 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
     if (prompt !== null) {
       flush();
       turns.push({ role: "user", ts, parts: prompt });
+      continue;
+    }
+    if (record.type === "context.undo") {
+      // `/undo`: Kimi drops the last `count` prompts and everything after each, as its own view does
+      flush();
+      const count = (record as { count?: unknown }).count;
+      for (let undone = 0; typeof count === "number" && undone < count && turns.length > 0;) if (turns.pop()!.role === "user") undone += 1;
+      pending.clear();
       continue;
     }
     if (record.type !== "context.append_loop_event" || record.event === null || typeof record.event !== "object") continue;

@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, openSync, closeSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, openSync, closeSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { forgetTranscriptState, transcriptPage } from "./conversation.ts";
@@ -152,6 +152,19 @@ it("keeps an idle Kimi's last session while the same process runs in the pane, a
   expect(kimiWireForPane("w9:p1", [process.pid], home)).toBe(wire("session_b"));
 });
 
+it("lets go of an idle Kimi's session once the folder starts another", () => {
+  const { home, wire, lock } = kimiHome("session_a");
+  lock("session_a", liveLock());
+  expect(kimiWireForPane("w8:p1", [process.pid], home)).toBe(wire("session_a"));
+  rmSync(join(home, ".kimi-code", "locks", "sessions", "session_a.lock"));
+  expect(kimiWireForPane("w8:p1", [process.pid], home)).toBe(wire("session_a"));
+  // `/new` while idle: the new session has no lock yet
+  const later = new Date(Date.now() + 5_000);
+  mkdirSync(join(wire("session_a"), "..", "..", "..", "..", "session_b"));
+  utimesSync(join(wire("session_a"), "..", "..", "..", ".."), later, later);
+  expect(kimiWireForPane("w8:p1", [process.pid], home)).toBeNull();
+});
+
 it("ignores a lock a crashed process left behind, another host's and a broken one", () => {
   const { home, lock } = kimiHome("session_old", "session_far");
   // written before this pid's process started: a dead process's, its pid since reused
@@ -187,6 +200,14 @@ it.skipIf(process.platform !== "linux")("without a lock, binds the main wire log
     const mainFd = openSync(wire("session_m"), "r");
     try { expect(kimiWireForProcesses([process.pid], home)).toBe(wire("session_m")); } finally { closeSync(mainFd); }
   } finally { closeSync(subFd); }
+});
+
+it("drops the prompts /undo took back, with their answers", () => {
+  const prompt = (text: string) => ({ type: "context.append_message", message: { role: "user", origin: { kind: "user" }, content: text } });
+  const answer = (text: string) => ({ type: "context.append_loop_event", event: { type: "content.part", part: { type: "text", text } } });
+  const text = jsonl([prompt("one"), answer("A1"), prompt("two"), answer("A2"), { type: "context.undo", count: 1 }, prompt("two-fixed"), answer("A3")]);
+  expect(parseKimiTranscript(text).map((turn) => `${turn.role}:${turn.parts.map((part) => part.kind === "text" ? part.text : "").join("")}`))
+    .toEqual(["user:one", "assistant:A1", "user:two-fixed", "assistant:A3"]);
 });
 
 it("pages at every prompt the parser shows, an image-only one too", () => {
