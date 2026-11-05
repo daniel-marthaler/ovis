@@ -1037,11 +1037,20 @@ Alert rows of the table above from the `--droplet-*` roles in `src/styles.css`.
   A lone pane beside such a `⋯` draws no second ellipsis (its actions are in the tab's menu), on a
   desktop as on touch. The pane's own context menu carries pane actions; it opens at the pointer
   without changing which pane is focused. The pane header's ellipsis opens the same menu on touch.
-  A lone tab with no row (a phone's screen made short by its keyboard) keeps that ellipsis at the
-  pane's top right, below a glass header and never under the header's own `⋯`, as an iPhone
-  navigation bar (and the Claude iOS app) keeps one overflow button in the bar and the content's
-  controls below it. Wherever that ellipsis shows to a finger, the pane's banners (View only and the
-  rest) start below it, so none covers it.
+  A lone tab with no row (a phone at most 700px tall, including the iPhone Duo's 678-point outer
+  display, landscape or a screen made short by its keyboard) draws no pane ellipsis either: a second
+  `⋯` below the glass header would repeat the header's own. The header's `⋯` is then the one menu,
+  as an iPhone navigation bar (and the Claude iOS app) keeps one overflow button in the bar. After its
+  own items and a divider it carries what the missing row's menu would: a split tab's panes first,
+  then the pane's actions, then New terminal (the row's `+`), New tab with agent… (as Chrome for
+  iPhone keeps New Tab in its overflow menu) and Rename tab, in a dialog in place of the row's inline
+  field, which the palette's Rename tab and its shortcut open too. Move to workspace… (a one-pane
+  tab) lists the other workspaces in a second menu, where the row's menu lists them in place, and
+  Close tab asks first, as the row's does for a workspace's last tab: it closes the workspace too,
+  and is the one way to close a split tab whole there. Extending the compact-height state to the Duo follows
+  Apple's outer-display guidance to put chrome at the edge and preserve vertical room for content.
+  Wherever a lone pane's ellipsis shows to a finger, the pane's banners (View only and the rest)
+  start below it, so none covers it; with no row they start below the glass header.
 - On a PC whose terminals are the Herdr app's (`HerdrIdentity.runtime` `herdr-core`), the app's
   window owns the workspaces, tabs and splits, and herdr-core refuses to rename, reorder or move
   them, to split, swap, zoom or resize a pane, and the worktree actions. The browser then leaves
@@ -1461,6 +1470,12 @@ Alert rows of the table above from the `--droplet-*` roles in `src/styles.css`.
   so a footer row kept showing in every browser tab and in browsers that never prompt. Settings →
   Phone & devices → Install offers it when the browser can install, and the steps otherwise,
   as the Claude web app keeps getting its apps in the account menu rather than a sidebar row.
+- Above that row, only where the page is one PC of a phone's list (a PC's page on the hosted
+  relay shell, or the phone app), one full-width row (`.sidebar-footer-pc`) names the PC, the lone
+  Host's name its header no longer shows, then **Change PC** in `--text-dim` and a switch glyph: a
+  tap goes back to the list of PCs (the shell's front page, or the app's list), as the Claude app's
+  sidebar foot names whose account it is and switches it in one tap. Settings → Phone & devices
+  keeps its Change PC row. A PC's own app never shows it: its sidebar lists its PCs itself.
 
 ### Plan meters (`.usage*`)
 - Right of the Settings gear, one button holding as many chips as the row has room for (judged
@@ -1619,7 +1634,8 @@ Alert rows of the table above from the `--droplet-*` roles in `src/styles.css`.
   alike, shows a few words of the first message its agent was given, about 24 columns (a wide
   character takes two) cut at a word's end with `…` (#2019); its hover stays the pane's title. A
   slash command, a path or a code fence names nothing, so the next line is taken, and an attached
-  file's `@path` mention is left out, an upload's path with spaces whole (#2637). An agent's own name
+  file's `@path` mention is left out, an upload's path with spaces whole (#2637), though never the
+  words after another mention (#2682). An agent's own name
   for its conversation comes before those words: the pane's name, else herdr's pane title, else the
   terminal title of Codex (its thread) or Claude Code (its topic), the agents that name the
   conversation there (another agent's says its state, "Ready"), unless it only says which agent runs
@@ -2008,6 +2024,19 @@ Alert rows of the table above from the `--droplet-*` roles in `src/styles.css`.
   the PC and split half the header shows, by the half that reported it: a recovery on one PC or half
   is not said once another is shown, and a pane's first connection is not a reconnect. A stalled
   output, which retries nothing, gets no line: the chip says disconnected. The return sends nothing: a draft stays a draft.
+- Beside the chip, always shown, one quiet mark says how this device reaches Ovis (`.conn-route`,
+  `components/ConnectionRouteMark.tsx`, `lib/connectionRoute.ts`): a 14px glyph and one short
+  `--text-dim` word, **relay** (the hosted shell, or a request Portal vouched for, whatever signed it in), **Tailscale** (a tailnet address, or a
+  request the server saw come through serve; a MagicDNS name alone says "Via Tailscale, or Funnel
+  from the internet", since the name serves both), **LAN** (a private address or a local-only name), **direct** (any other
+  address, a bare machine name and a request the server saw come through Funnel included) or
+  **local** (loopback: this PC, or a tunnel to another, which nothing can tell apart). The route,
+  not the connection's state, is its title and accessible text ("Via Tailscale"); the chip tells the
+  state. It is read from what the page owns and the server's own word on the request
+  (`observed_ingress`), never guessed. It is not a button and never wraps. At `<=480px` only the
+  relay keeps its word (the one most asked for) and the rest keep the glyph; below `360px` the
+  relay's word goes too, so the pane title keeps its room. The phone app's demo shows none. It
+  follows Paseo's app, which says beside a host whether it is reached directly or through its relay.
 
 ### Chat turn (`.chat-turn`)
 - Native conversation rows use LegendList 3.3.5, with the chat view as the single
@@ -2253,7 +2282,11 @@ Alert rows of the table above from the `--droplet-*` roles in `src/styles.css`.
   head shows only once the pane was seen at rest under that answer: at a turn's end herdr's status
   trails the answer (100–400 ms, longer on a busy PC), and a head under each answer would flash.
   It then waits 800 ms more, for a new turn's first row to bring its own head. While it waits it keeps its place unseen, so showing it moves
-  nothing a reader is selecting or reading. The Codex app never reopens a finished turn either. Before
+  nothing a reader is selecting or reading. The Codex app never reopens a finished turn either. The
+  other way round, herdr can rest before a read holds a Claude turn's answer (about 1 s at worst):
+  the turn stays at work until a read brings its answer or a turn of the user's, or for 2 s with
+  no such read. A read that only adds more of the unanswered turn starts the 2 s again. So it never
+  looks ended with no answer. The Codex app also keeps a turn working until its answer is in. Before
   the chat's first read, `Loading conversation…` is the only line: the rows read may hold the
   running turn's own head. A settled turn folds to its header
   with a hairline under it, and the header reads as a footnote: `--text-dim`, regular weight (the
@@ -3693,6 +3726,11 @@ Alert rows of the table above from the `--droplet-*` roles in `src/styles.css`.
   accounts already signed in; the guide opened again from Settings changes no setting (nor says it
   will).
 - "Start with …" and beside it a plain "Connect your phone", which opens a `--bg-panel` box under them.
+  On a first run on the PC itself (the desktop app, or a browser on its loopback) the box is open from
+  the start, as a phone is the next device to add; it leads with the relay only, so where the relay
+  cannot lead it stays closed instead of sending the page to Settings → Phone untapped. The relay stays
+  off until "Turn on the Ovis relay", as Paseo keeps its relay off until Enable relay; unlike Paseo,
+  which leaves pairing in Settings, the first run shows it.
   Where the Ovis relay can lead (offered here, nothing blocks it, not a watching device or a Portal
   visitor), the box leads with it (off until the user turns it on, then a QR code): one line on what it does, the device-gate note when turning
   it on closes the gate, and "Turn on the Ovis relay" as the primary button (the tap is the consent).

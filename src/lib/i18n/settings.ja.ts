@@ -340,6 +340,7 @@ export const SETTINGS_JA: Record<string, string> = {
   "Forget this PC?": "このPCを削除しますか？",
   "This phone's key for it is deleted here, and the PC keeps listing this phone until it is revoked there. Pairing again takes a new QR code from the PC.": "このスマホ側のキーを削除します。PC側ではそこで取り消すまでこのスマホが一覧に残ります。再度ペアリングするにはPCの新しいQRコードが必要です。",
   "Forget": "削除",
+  "Through Portal": "Portal経由",
   "Through the Ovis relay": "Ovis リレー経由",
   "This browser's request came from a phone paired through the Ovis relay, end-to-end encrypted: the relay could not read it.": "このブラウザーのリクエストは、Ovis リレー経由でペアリングしたスマートフォンから端末間暗号化で届きました。リレーは内容を読めません。",
   "Ready through the Ovis relay.": "Ovis リレー経由で接続できます。",
@@ -374,4 +375,8 @@ export const SETTINGS_JA: Record<string, string> = {
   "Ovis restarts and shows herdr TUI's terminals instead of the Herdr app's; this page reconnects by itself. The app's terminals keep running.": "Ovis が再起動し、Herdr アプリの代わりに herdr TUI のターミナルを表示して、このページは自動で再接続します。アプリのターミナルは動き続けます。",
   "Switch and restart": "切り替えて再起動",
   "Ovis has not answered since the restart. Reload this page in a moment; if it stays away, start Ovis again on this PC.": "再起動してから Ovis が応答しません。少ししてからこのページを再読み込みし、それでも応答がなければこの PC で Ovis を起動し直してください。",
+  "Add a PC through the relay": "リレー経由で PC を追加",
+  "No SSH or open port. On the other PC, turn the relay on in Settings → Phone & devices, choose Copy link, and paste it here.": "SSH も開いたポートも不要です。もう一方の PC の 設定 → スマートフォンとデバイス でリレーをオンにし、リンクをコピー を選んでここに貼り付けてください。",
+  "Pairing link": "ペアリングリンク",
+  "{name} was added. Its workspaces join the sidebar.": "{name} を追加しました。ワークスペースはサイドバーに並びます。",
 };

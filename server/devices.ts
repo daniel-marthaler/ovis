@@ -13,7 +13,7 @@
 import { createHash, createPublicKey, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type DevicePairedEvent, type DeviceRole, type DevicesRevokedAll, type PairedDevice, STREAM_COOKIE_PREFIX } from "../shared/protocol.ts";
+import { type DevicePairedEvent, type DevicePairToken, type DeviceRole, type DevicesRevokedAll, type PairedDevice, STREAM_COOKIE_PREFIX } from "../shared/protocol.ts";
 import type { Access } from "./access.ts";
 import { CLEAR_LEGACY_DEVICE_COOKIE, COOKIE_MAX_AGE_SECONDS, DEVICE_COOKIE_CLEARED, deviceCookie, isSecureRequest, noContent, parseCookies } from "./auth.ts";
 import { badRequest, isJsonObject, jsonResponse, setRequestRoute } from "./http.ts";
@@ -87,6 +87,11 @@ export function streamKeys(request: Request): string[] {
     if (keys.length === STREAM_KEYS_MAX) break;
   }
   return keys;
+}
+
+/** The request names `application/json` among the types it accepts: a browser's fetch sends `*\/*` and never asks. */
+function acceptsJson(request: Request): boolean {
+  return (request.headers.get("accept") ?? "").split(",").some((type) => type.split(";")[0]!.trim().toLowerCase() === "application/json");
 }
 
 export function newStreamKey(): string {
@@ -166,6 +171,7 @@ export class DeviceStore {
   private unconfirmedFirstPairs: UnconfirmedFirstPair[] = [];
   private readonly path: string;
   private readonly revocations = new Map<string, Set<() => void>>();
+  private readonly revokeAllListeners = new Set<() => void>();
   private readonly pairings = new Set<(event: DevicePairedEvent, origin: readonly string[]) => void>();
   readonly error: string | null = null;
 
@@ -300,13 +306,13 @@ export class DeviceStore {
   }
 
   /** One authorization write precedes every state change and enrollment announcement. */
-  private enroll(device: StoredDevice, now: number, origin: readonly string[]): void {
+  private enroll(device: StoredDevice, now: number, origin: readonly string[], codeSpent = true): void {
     const next = [...this.devices, device];
     const gate = this.gateClosedAt ?? device.created_at;
     this.save(next, gate);
     this.devices = next;
     this.gateClosedAt = gate;
-    this.pending = null;
+    if (codeSpent) this.pending = null;
     // A relay enrollment closes the gate immediately, invalidating every first-cookie candidate.
     if (device.relay_public_key !== undefined) this.unconfirmedFirstPairs = [];
     this.announce(device, now, origin);
@@ -314,21 +320,43 @@ export class DeviceStore {
 
   /** No cookie is issued: even the first relay pairing is durable and closes the gate at once. */
   pairRelay(code: string, label: string, publicKey: string, now = Date.now()): { device: DeviceMatch } | null {
-    this.assertWritable();
-    if (now < this.relayBlockedUntil) throw new PairingRateLimitedError(Math.ceil((this.relayBlockedUntil - now) / 1000));
-    this.relayFailures = this.relayFailures.filter((at) => now - at < PAIRING_WINDOW_MS);
+    this.assertRelayPairing(now);
     if (!this.checkPairingCode(code, now) || !isRelayPublicKey(publicKey)) {
-      this.relayFailures.push(now);
-      if (this.relayFailures.length >= 20) this.relayBlockedUntil = now + PAIRING_WINDOW_MS;
+      this.noteRelayFailure(now);
       return null;
     }
+    return this.enrollRelay(label, publicKey, now, true);
+  }
+
+  /** Throws while relay pairing is paused after too many failures; both pairing ways share the count. */
+  assertRelayPairing(now = Date.now()): void {
+    this.assertWritable();
+    if (now < this.relayBlockedUntil) throw new PairingRateLimitedError(Math.ceil((this.relayBlockedUntil - now) / 1000));
+  }
+
+  /** A relay pairing that did not end in a device: a wrong code, or a comparison declined, abandoned or timed out. */
+  noteRelayFailure(now = Date.now()): void {
+    this.relayFailures = this.relayFailures.filter((at) => now - at < PAIRING_WINDOW_MS);
+    this.relayFailures.push(now);
+    if (this.relayFailures.length >= 20) this.relayBlockedUntil = now + PAIRING_WINDOW_MS;
+  }
+
+  /** A pairing by comparing digits the owner approved on this PC (server/relay/session.ts): no code is spent. */
+  pairRelayApproved(label: string, publicKey: string, now = Date.now()): { device: DeviceMatch } | null {
+    this.assertRelayPairing(now);
+    if (!isRelayPublicKey(publicKey)) { this.noteRelayFailure(now); return null; }
+    // no code was used, so one still showing on the PC keeps working
+    return this.enrollRelay(label, publicKey, now, false);
+  }
+
+  private enrollRelay(label: string, publicKey: string, now: number, codeSpent: boolean): { device: DeviceMatch } {
     const device: StoredDevice = {
       id: randomBytes(8).toString("hex"), label: normalizeLabel(label, "Device"), role: "drive",
       token_hash: hash(randomBytes(32).toString("hex")), relay_public_key: publicKey,
       // PAIR authenticates this relay session too, so the device is seen as it pairs.
       created_at: new Date(now).toISOString(), last_seen_at: new Date(now).toISOString(),
     };
-    this.enroll(device, now, []);
+    this.enroll(device, now, [], codeSpent);
     return { device: { id: device.id, label: device.label, role: device.role } };
   }
 
@@ -438,6 +466,16 @@ export class DeviceStore {
    * The gate stays closed, with a timestamp even when nothing was ever confirmed (only first-pair
    * candidates existed): revoking must never reopen the LAN, not even after a restart.
    */
+  /**
+   * Told on every revokeAll, after the empty registry is saved: a relay pairing by comparing digits
+   * that is still under way (server/relay/session.ts) ends there, approved or not, so no device is
+   * made from a comparison the owner's "revoke all" came after.
+   */
+  onRevokeAll(listener: () => void): () => void {
+    this.revokeAllListeners.add(listener);
+    return () => { this.revokeAllListeners.delete(listener); };
+  }
+
   revokeAll(): string[] {
     this.assertWritable();
     const gate = this.gateClosedAt ?? this.devices[0]?.created_at ?? new Date().toISOString();
@@ -450,6 +488,7 @@ export class DeviceStore {
     const listeners = [...this.revocations.values()];
     this.revocations.clear();
     for (const closes of listeners) for (const close of closes) close();
+    for (const listener of [...this.revokeAllListeners]) listener();
     return revoked;
   }
 
@@ -486,9 +525,19 @@ export async function handleDeviceRequest(request: Request, pathname: string, st
     const body = await json();
     if (body instanceof Response) return body;
     if (typeof body["code"] !== "string") return badRequest("missing_code", "code is required");
+    const firstPair = !store.gated;
     const paired = store.pair(body["code"], normalizeLabel(body["label"], "Device"), "drive", Date.now(), streamKeys(request));
     if (paired === null) return jsonResponse({ error: { code: "invalid_code", message: "the code is wrong, spent or expired; start a new pairing on the PC" } }, 401);
-    return noContent(deviceCookie(paired.token, isSecureRequest(request)), CLEAR_LEGACY_DEVICE_COOKIE);
+    const cookies = [deviceCookie(paired.token, isSecureRequest(request)), CLEAR_LEGACY_DEVICE_COOKIE];
+    if (!acceptsJson(request)) return noContent(...cookies);
+    // a script asked for the token itself, to send as `Authorization: Device <token>` (#2744); a
+    // browser never asks, so its page never reads the credential its HttpOnly cookie keeps. A first
+    // pairing waits in memory for its cookie to come back; a script may store the token and use it
+    // after a restart, so its pairing is confirmed (written, gate closed) before the answer
+    if (firstPair) store.match(paired.token);
+    const answer = jsonResponse({ token: paired.token } satisfies DevicePairToken, 200, { "cache-control": "no-store" });
+    for (const cookie of cookies) answer.headers.append("set-cookie", cookie);
+    return answer;
   }
   if (pathname === "/api/devices") {
     setRequestRoute(pathname);

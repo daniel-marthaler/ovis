@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
-import type { DevicePairedEvent, Machine, MachineEvent } from "../../shared/machines.ts";
+import type { DevicePairedEvent, Machine, MachineEvent, RelayPairingRequest } from "../../shared/machines.ts";
 import { ApiError, authenticate, fetchMachines, observePaneSessions, paneSessionEvents, paneSessionsMoving, verifySourceBoot } from "./api.ts";
 import { passingFolder, recentDirectories } from "./recent-directories.ts";
 import { keepMachineEvents } from "./machineEventStream.ts";
@@ -17,6 +17,7 @@ import type { NotificationTarget } from "./notificationTarget.ts";
 import type { SelectionMark } from "./selectionMark.ts";
 import type { SplitState } from "./split.ts";
 import { deviceInUse, followsHerdrFocus, movingHerdrFocusOn } from "./followFocus.ts";
+import { pruneWaitingSends } from "./sentWaiting.ts";
 import { paneLifetimes } from "./paneLifetime.ts";
 import { displayPaneTitle } from "../components/Sidebar.tsx";
 import type { usePreferencesSync } from "./preferencesSync.ts";
@@ -105,6 +106,7 @@ export function useRosterLoader({ rosterIn, setMachines, setMachineRosterLoaded,
       await snapshotRequests.current.read(fetchMachines, (next) => {
         // a PC whose herdr was replaced leaves its panes' drafts and lenses before they are drawn
         paneLifetimes.observe(next, displayPaneTitle);
+        pruneWaitingSends(next);
         // a pane's conversation answers stand for the session it was on: the chats read this roster's
         observePaneSessions(next, readAfter);
         reorderCoordinator.roster(next, { kind: "load", started });
@@ -167,7 +169,7 @@ export function useRosterLoader({ rosterIn, setMachines, setMachineRosterLoaded,
   return { snapshotRequests, reorderCoordinator, load, scheduleRefetch };
 }
 
-export function useRosterEvents({ machineSessions, locked, receivePreferencesRef, snapshotRequests, onRoster, reorderCoordinator, setMachines, rosterIn, setMachineRosterLoaded, machinesRef, onPaneStatus, onPaneExited, followFocusRef, selectionRef, splitShownRef, splitRef, pendingLink, selectionHint, setSelectedPaneId, setNotificationViewTarget, setTerminalPeek, setAutoSelected, scheduleRefetch, preferencesResubscribedRef, preferencesDisconnectedRef, preferencesClosedRef, dropIn, chime, setPairedNotices, getTakeNotificationTargetRef }: {
+export function useRosterEvents({ onPaneMoved, machineSessions, locked, receivePreferencesRef, snapshotRequests, onRoster, reorderCoordinator, setMachines, rosterIn, setMachineRosterLoaded, machinesRef, onPaneStatus, onPaneExited, followFocusRef, selectionRef, splitShownRef, splitRef, pendingLink, selectionHint, setSelectedPaneId, setNotificationViewTarget, setTerminalPeek, setAutoSelected, scheduleRefetch, preferencesResubscribedRef, preferencesDisconnectedRef, preferencesClosedRef, dropIn, chime, setPairedNotices, setRelayPairings, getTakeNotificationTargetRef }: {
   machineSessions: MachineSessionRegistry;
   locked: boolean | null;
   receivePreferencesRef: RefObject<ReturnType<typeof usePreferencesSync>["receive"]>;
@@ -180,6 +182,8 @@ export function useRosterEvents({ machineSessions, locked, receivePreferencesRef
   machinesRef: RefObject<Machine[]>;
   onPaneStatus: ReturnType<typeof useAlertSignals>["onPaneStatus"];
   onPaneExited: ReturnType<typeof useAlertSignals>["onPaneExited"];
+  /** herdr moved a pane of a PC under a new ID (the server's pane-moved, #1503) */
+  onPaneMoved: (machineId: string, from: string, to: string) => void;
   followFocusRef: RefObject<boolean>;
   selectionRef: RefObject<SelectionMark>;
   splitShownRef: RefObject<boolean>;
@@ -197,6 +201,8 @@ export function useRosterEvents({ machineSessions, locked, receivePreferencesRef
   dropIn: ReturnType<typeof useAlertSignals>["dropIn"];
   chime: ReturnType<typeof useAlertSignals>["chime"];
   setPairedNotices: Dispatch<SetStateAction<readonly DevicePairedEvent[]>>;
+  /** relay pairings waiting for this PC's owner (components/RelayPairingPrompt.tsx) */
+  setRelayPairings: Dispatch<SetStateAction<readonly RelayPairingRequest[]>>;
   getTakeNotificationTargetRef: () => RefObject<(target: NotificationTarget) => void>;
 }) {
   useCloseSessionsWhenLocked(machineSessions, locked);
@@ -210,10 +216,12 @@ export function useRosterEvents({ machineSessions, locked, receivePreferencesRef
       if (payload.type === "seen") { receiveSeen(payload.finishes); return; }
       // a device paired with this server: told once per enrollment, kept until read, the oldest giving way
       if (payload.type === "device-paired") { setPairedNotices((list) => withPairedNotice(list, payload)); return; }
+      if (payload.type === "relay-pairings") { setRelayPairings(payload.pairings); return; }
       // A poll started before this event can carry an older roster or pane status.
       snapshotRequests.current.invalidate();
       if (payload.type === "machines") {
         paneLifetimes.observe(payload.machines, displayPaneTitle);
+        pruneWaitingSends(payload.machines);
         observePaneSessions(payload.machines);
         onRoster(payload.machines);
         reorderCoordinator.roster(payload.machines, { kind: "event" });
@@ -256,6 +264,8 @@ export function useRosterEvents({ machineSessions, locked, receivePreferencesRef
         setNotificationViewTarget(null); setTerminalPeek(null);
         setAutoSelected(true);
       }
+      // told before the structure change of the move: the pane's state and view go to the new ID first
+      if (message.type === "pane-moved") onPaneMoved(machine.id, message.from, message.to);
       if (message.type === "session-changed" || message.type === "pane-exited") {
         // until the roster after it comes, the panes' sessions are not known: no press read of the old one is taken
         paneSessionsMoving(machine.id);

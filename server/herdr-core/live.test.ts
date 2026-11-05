@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { herdrRpc, paneMoveToNewTab, ping, sessionSnapshot, tabRename, workspaceClose, workspaceCreate, workspaceRename } from "../herdr/client.ts";
+import { startHerdrCoreAdapter } from "./adapter.ts";
 import { CoreAttachSession } from "./attach-session.ts";
 import { HcConnection } from "./connection.ts";
 import { buildSnapshot } from "./snapshot.ts";
@@ -240,5 +242,54 @@ describe.skipIf(!bin)("hc client against a real hc", () => {
       await hc.call("terminal.rm", { terminal: address });
     }
     await subscription.channel.close();
+  }, TEST_MS);
+
+  it("renames and moves Ovis's own workspaces and tabs in labels, and splits them in its own document, on a core no Herdr app arranges", async () => {
+    const socket = join(dir, "herdr.sock");
+    const adapter = await startHerdrCoreAdapter(hc, socket);
+    // the core is this test's own and stops in afterAll: a failure here leaves nothing for another test
+    try {
+      expect((await ping(socket)).layout).toEqual({ rename: true, split: true, move: true, arrange: true });
+      const api = await workspaceCreate({ cwd: dir, label: "api" }, socket);
+      const web = await workspaceCreate({ cwd: dir, label: "web" }, socket);
+
+      await workspaceRename(api.workspace.workspace_id, "backend", socket);
+      await tabRename(api.tab.tab_id, "server", socket);
+      // #2812: split right, then the first pane down; a viewer sizes each terminal to its pane, and the panes keep their places
+      const right = (await herdrRpc<{ pane: HerdrPane }>("pane.split", { target_pane_id: api.root_pane.pane_id, direction: "right" }, socket)).pane;
+      const down = (await herdrRpc<{ pane: HerdrPane }>("pane.split", { target_pane_id: api.root_pane.pane_id, direction: "down" }, socket)).pane;
+      const tabRects = async () => (await sessionSnapshot(socket)).layouts.find((layout) => layout.tab_id === api.tab.tab_id)!.panes.map((pane) => [pane.pane_id, pane.rect]);
+      const placed = [
+        [api.root_pane.pane_id, { x: 0, y: 0, width: 500, height: 500 }],
+        [down.pane_id, { x: 0, y: 500, width: 500, height: 500 }],
+        [right.pane_id, { x: 500, y: 0, width: 500, height: 1000 }],
+      ];
+      expect(await tabRects()).toEqual(placed);
+      for (const [paneId, cols, rows] of [[api.root_pane.pane_id, 15, 1], [down.pane_id, 56, 29], [right.pane_id, 56, 29]] as const) {
+        const { channel } = await hc.open("terminal.attach", { terminal: paneId, cols, rows }, { onData: () => {}, onClose: () => {} });
+        await channel.close();
+      }
+      expect(await tabRects()).toEqual(placed);
+      expect(await tabRects()).toEqual(placed);
+      expect((await hc.call("doc.get", { name: "ovis-layout" })).version).toBe(2);
+      await herdrRpc("pane.close", { pane_id: down.pane_id }, socket);
+      await herdrRpc("pane.close", { pane_id: right.pane_id }, socket);
+
+      let snapshot = await sessionSnapshot(socket);
+      expect(snapshot.workspaces.find((workspace) => workspace.workspace_id === api.workspace.workspace_id)?.label).toBe("backend");
+      expect(snapshot.tabs.find((tab) => tab.tab_id === api.tab.tab_id)?.label).toBe("server");
+      expect(snapshot.panes.filter((pane) => pane.tab_id === api.tab.tab_id).map((pane) => pane.pane_id)).toEqual([api.root_pane.pane_id]);
+
+      const moved = await paneMoveToNewTab(web.root_pane.pane_id, api.workspace.workspace_id, "moved", socket);
+      expect(moved).toMatchObject({ pane: { pane_id: web.root_pane.pane_id, workspace_id: api.workspace.workspace_id }, closed_tab_id: web.tab.tab_id, closed_workspace_id: web.workspace.workspace_id });
+      snapshot = await sessionSnapshot(socket);
+      expect(snapshot.workspaces.some((workspace) => workspace.workspace_id === web.workspace.workspace_id)).toBe(false);
+      expect(snapshot.tabs.filter((tab) => tab.workspace_id === api.workspace.workspace_id).map((tab) => tab.label)).toEqual(["server", "moved"]);
+      // the moved pane takes its new workspace's name, so it never renames it
+      expect(snapshot.workspaces.find((workspace) => workspace.workspace_id === api.workspace.workspace_id)?.label).toBe("backend");
+      await workspaceClose(api.workspace.workspace_id, socket);
+    } finally {
+      adapter.stop();
+    }
   }, TEST_MS);
 });

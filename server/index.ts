@@ -1,4 +1,5 @@
 import "./adopt-legacy-env.ts";
+import type { RelaySocket } from "../shared/relay-channel.ts";
 import { createCore, type SocketData } from "./core/index.ts";
 import { ClientConnectionLog } from "./client-connection-log.ts";
 import { RequestLog } from "./request-log.ts";
@@ -13,6 +14,7 @@ import { isLoopbackBind, lanExposed } from "./access.ts";
 import { DeviceStore } from "./devices.ts";
 import { PreferenceStore } from "./preferences.ts";
 import { SeenStore } from "./seen.ts";
+import type { SeenFinish } from "../shared/seen.ts";
 import { TailnetIdentitySource } from "./tailscale.ts";
 import { SHELL_AGENTS, ShellAgentLocator } from "./shell-agent.ts";
 import { AgentDetector, catalogLocator, defaultLoginProbe } from "./agent-catalog-detect.ts";
@@ -22,10 +24,9 @@ import { AGENT_CATALOG, catalogPlatform } from "../shared/agent-catalog.ts";
 import { AgentInstaller } from "./agent-catalog-install.ts";
 import { type BackgroundAgentDeps } from "./background-agent.ts";
 import { herdrSocketPath, ping } from "./herdr/client.ts";
-import { coreConnection, hcBin, NoHerdrCoreError, servingCore, setRuntime, startRuntime } from "./herdr-core/runtime.ts";
+import { coreConnection, coreSeenMarker, hcBin, NoHerdrCoreError, servingCore, setRuntime, startRuntime } from "./herdr-core/runtime.ts";
 import { chooseRuntime, runtimeService, type RuntimeChoice, type RuntimeService } from "./herdr-core/runtime-choice.ts";
 import { bridgePins } from "./herdr-core/pin-label.ts";
-import { SeenMarker } from "./herdr-core/seen-label.ts";
 import { herdrCoreFacts } from "./herdr-core/discovery.ts";
 import { type HerdrCoreFacts, LOCAL_MACHINE } from "../shared/machines.ts";
 import { type AlertTiming, defaultStateDir } from "./push.ts";
@@ -167,6 +168,8 @@ export function createServer(
     /** voice input's key, provider and models; tests pass one with their own env and fetch */
     voice?: VoiceService;
     machines?: boolean;
+    /** how PCs added through the relay reach it (server/relay-pc.ts); tests point it at a local relay */
+    relayPcSocket?: (url: string) => RelaySocket;
     /** a bridge this app starts on a PC (server/remote-entry.ts): its token is the credential its connection server holds, and no browser reaches it, so its snapshots go whole (#2160) */
     bridgeOnly?: boolean;
     /** Read-only saved profiles from the local herdr client; tests supply their own catalog. */
@@ -300,19 +303,31 @@ export function createServer(
   // A bridge this app starts on a PC (`bridgeOnly`, server/remote-entry.ts) serves only its connection server, with
   // the credential it registered as its token: that server applies its own rows, so it gets every snapshot whole.
   const browserSnapshot = <S extends SessionSnapshot>(snapshot: S): S => options.bridgeOnly ? snapshot : snapshotWithoutHiddenTokens(herdrSidebar.get(), snapshot);
-  const core = createCore({ options: { ...options, stateDir, openCodeState, orderSequence }, devices, preferences, usage, usageLogin, browserSnapshot, TYPED_SETTLE_MS, KEY_SETTLE_MS, SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, DRAFT_CLEAR_WAIT_MS, DRAFT_CLEAR_POLL_MS });
+  const core = createCore({ options: { ...options, stateDir, openCodeState, orderSequence, seenMoved: (from, to, renumber) => seen.moved(LOCAL_MACHINE, from, to, renumber) }, devices, preferences, usage, usageLogin, browserSnapshot, TYPED_SETTLE_MS, KEY_SETTLE_MS, SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, DRAFT_CLEAR_WAIT_MS, DRAFT_CLEAR_POLL_MS });
   const { machines, collector, queueFirstMessage, push } = core;
   // read finishes are kept until this server knows their herdr run ended
   const seen = new SeenStore(stateDir, (pc, epoch) => machines?.finishEnded(pc, epoch) ?? false);
+  // a pane another PC's herdr moved under a new ID: what was read under the old ID is read under the new one (#1503;
+  // this PC's own moves are told with their numbering above)
+  machines?.subscribe((event) => {
+    if (event.type !== "machine-message" || event.machine_id === LOCAL_MACHINE || event.message.type !== "pane-moved") return;
+    try { seen.moved(event.machine_id, event.message.from, event.message.to); }
+    catch (error) { console.warn(`seen: could not carry the reads of ${event.message.from} to ${event.message.to}:`, error); }
+  });
   // on herdr-core a finish read here is read in the Herdr app and its other clients too: only the
-  // pane's finish now, so a read told late never marks a turn that ended since as seen
-  const seenMarker = servingCore() ? new SeenMarker(coreConnection()) : null;
-  if (seenMarker) seen.subscribe((finish) => {
-    if (finish.pc !== LOCAL_MACHINE || machines?.finishEnded(finish.pc, finish.epoch) !== false) return;
+  // pane's finish now, so a read told late never marks a turn that ended since as seen. A pane brought
+  // into view writes it again (shared/seen.ts SeenPresentation); one left on screen does not
+  const seenMarker = servingCore() ? coreSeenMarker() : null;
+  const markSeen = (finish: SeenFinish, again: boolean) => {
+    if (!seenMarker || finish.pc !== LOCAL_MACHINE || machines?.finishEnded(finish.pc, finish.epoch) !== false) return;
     const pane = machines.list().find((machine) => machine.id === LOCAL_MACHINE)?.snapshot?.panes.find((candidate) => candidate.pane_id === finish.pane);
     if (pane?.agent_status !== "done" || pane.finish_id !== finish.id) return;
-    seenMarker.mark(finish.pane).catch((error: unknown) => console.warn(`herdr-core: could not mark ${finish.pane} seen:`, error));
-  });
+    seenMarker.mark(finish.pane, again).catch((error: unknown) => console.warn(`herdr-core: could not mark ${finish.pane} seen:`, error));
+  };
+  if (seenMarker) {
+    seen.subscribe((finish, presented) => { if (presented !== "new") markSeen(finish, false); });
+    seen.onPresented((finish) => markSeen(finish, true));
+  }
   // started after createCore's Node probe (server/pty/sidecar.ts), which can hold the thread up to 3 s: that wait
   // would count against the read's own 2.5 s limit, and a read cut short leaves the owner unknown for 5 minutes
   identityOf(false, null);
@@ -486,7 +501,7 @@ if (import.meta.main) {
   }
   const updates = connectUpdater();
   const version = (JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as { version: string }).version;
-  const telemetry = new Telemetry({ stateDir, version, env: process.env, fetch, previousVersion: () => updates.installed().previous_version });
+  const telemetry = new Telemetry({ stateDir, version, env: process.env, fetch, previousVersion: () => updates.installed().previous_version, runtime: herdrCore === null ? "herdr" : "herdr-core" });
   const portal = new PortalService({ stateDir });
   const relay = new RelayService({ stateDir });
   let instance: ReturnType<typeof createServer>;

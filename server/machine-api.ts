@@ -1,5 +1,5 @@
 import { subscribeMachineEvents } from "./machine-events.ts";
-import type { DevicePairedEvent, MachineRoster, SetupAction, SetupRequest } from "../shared/machines.ts";
+import type { DevicePairedEvent, MachineRoster, RelayPairingsEvent, SetupAction, SetupRequest } from "../shared/machines.ts";
 import type { AgentRowTokens } from "../shared/pane-tokens.ts";
 import type { SharedPreferences } from "../shared/preferences.ts";
 import type { PanePromptResponse, SessionSnapshot } from "../shared/protocol.ts";
@@ -118,8 +118,8 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
   preferences?: { get(): SharedPreferences; subscribe(listener: (preferences: SharedPreferences) => void): () => void }, readOnly = false,
   herdrSidebar?: { get(): AgentRowTokens | null; subscribe(listener: (agents: AgentRowTokens | null) => void): () => void },
   seen?: { list(): SeenFinish[]; subscribe(listener: (finish: SeenFinish) => void): () => void },
-  /** durable device enrollments (server/devices.ts), already without the ones this stream's own device made */
-  pairings?: { subscribe(listener: (event: DevicePairedEvent) => void): () => void },
+  /** durable device enrollments (server/devices.ts), already without the ones this stream's own device made, and relay pairings waiting for approval */
+  pairings?: { subscribe(listener: (event: DevicePairedEvent | RelayPairingsEvent) => void): () => void },
   relayBudget?: EventStreamBudget): Promise<Response> {
   const url = new URL(request.url);
   // A PC's file opens as this PC's /api/fs/file does, from any navigation: reading it changes
@@ -248,6 +248,14 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
         cancel() { close(); },
       }, new ByteLengthQueuingStrategy({ highWaterMark: MACHINE_EVENTS_QUEUE_BYTES }));
       return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" } });
+    }
+    if (parts[0] === "relay" && parts.length === 1 && request.method === "POST") {
+      setRequestRoute("/api/machines/relay");
+      // the link holds a one-time pairing code, a secret like an SSH password
+      if (!canSendSecret(request)) return fail("https_required", "A pairing link requires HTTPS or localhost", 403);
+      const body: unknown = await request.json().catch(() => null);
+      if (!isJsonObject(body)) return fail("invalid_body", "Expected a pairing link", 400);
+      return jsonResponse({ machine: await manager.addRelay(body.link, body.name) }, 201);
     }
     if (parts[0] === "setup") {
       if (parts.length === 1 && request.method === "POST") { setRequestRoute("/api/machines/setup"); return jsonResponse(manager.setup(await request.json() as SetupRequest), 202); }

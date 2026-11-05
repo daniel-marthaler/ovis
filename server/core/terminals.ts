@@ -110,7 +110,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
       const buffered = backlog(client);
       if (window) {
         // an ACK client: measured by its ACK progress, and a joiner draining its replay never pauses the pty
-        const verdict = window.check(buffered);
+        const verdict = window.check(buffered, Date.now(), client.getBufferedAmount() - buffered);
         if (verdict === "stop") end(client, "stalled");
         else if (verdict === "pause") paused = true;
         continue;
@@ -177,6 +177,32 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     });
     retiringAttachments.set(paneId, retired);
     attachment.process.kill();
+  }
+
+  /**
+   * herdr moved the pane under a new ID: the attach made as `from` ends for its clients (`pty-exit`), and the
+   * first attach as `to` waits for that process to exit, as it holds herdr's one attach slot until then (#1503).
+   */
+  function paneMoved(from: string, to: string): void {
+    if (from === to) return;
+    // what `from` still retires: an earlier move's wait carried to it included, so A to B to C waits for A
+    const retire = (): Promise<void> | undefined => {
+      if (attachments.has(from)) {
+        broadcast(from, { type: "pty-exit", pane_id: from, code: null });
+        closeAttachment(from);
+      }
+      return retiringAttachments.get(from);
+    };
+    // one still being created ends once it is; the new ID waits for that from now, not from then
+    const creating = pendingAttachments.get(from);
+    const exited = creating ? creating.then(retire, () => retiringAttachments.get(from)) : retire();
+    if (!exited) return;
+    const earlier = retiringAttachments.get(to);
+    // a process that failed to exit cleanly still let go: the wait never refuses the attach behind it
+    const waited: Promise<void> = Promise.all([earlier, exited]).then(() => undefined, () => undefined).finally(() => {
+      if (retiringAttachments.get(to) === waited) retiringAttachments.delete(to);
+    });
+    retiringAttachments.set(to, waited);
   }
 
   /** An interact client's terminal sizes the pty: the grid is remembered as this client's, and it drives. */
@@ -494,5 +520,5 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
   // the same live records, read through their grid and held state only: the server outside reaches a
   // pane's terminal through `sight`, `poke` and the frames
   const views: ReadonlyMap<string, AttachmentView> = attachments;
-  return { attachments: views, conversations, reconcileOutput, closeAttachment, detachClaimed, dropClaims, sight, poke, drainOutput, terminalFrames };
+  return { attachments: views, conversations, reconcileOutput, closeAttachment, paneMoved, detachClaimed, dropClaims, sight, poke, drainOutput, terminalFrames };
 }

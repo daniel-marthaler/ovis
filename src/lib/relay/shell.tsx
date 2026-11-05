@@ -16,12 +16,14 @@ import { deviceLabel } from "../phone.ts";
 import { registerPendingPush } from "../push.ts";
 import type { PendingPushStore } from "../push.ts";
 import { alertPrefs, loadSettings, SettingsProvider } from "../settings.ts";
+import { onLazyChunkFailure } from "../lazyChunk.ts";
+import { requestFreshShell } from "../shellMode.ts";
 import { setTransport } from "../transport.ts";
 import { takeEntryUrl } from "./boot.ts";
 import { RelayUnreachableError } from "./channel.ts";
 import { indexedDeviceStore, indexedPendingPush, ServerIdentityChangedError } from "./device.ts";
 import type { RelayDeviceStore } from "./device.ts";
-import { failureOf, forgedOffer, forgetsDevice, iosBrowserTab, keyMismatch, offerOf, shellEntry } from "./shellState.ts";
+import { failureOf, forgedOffer, forgetsDevice, iosBrowserTab, keyMismatch, offerOf, pairsAgainWithoutKey, shellEntry } from "./shellState.ts";
 import type { PcUpdate, RelayShellState } from "./shellState.ts";
 import { relaySkew, reloadOnce } from "./skew.ts";
 import type { ReloadMemory } from "./skew.ts";
@@ -55,13 +57,18 @@ const UPDATE_POLL_MS = 1000;
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
-async function reloadPage(): Promise<void> {
+async function reloadPage(serverId: string | null): Promise<void> {
   try {
     const registration = await navigator.serviceWorker?.getRegistration();
     // a worker check that hangs must not keep the stale shell up: the reload goes on without it
     await Promise.race([registration?.update(), wait(5000)]);
   } catch (error) { console.warn("Ovis: the service worker did not check for a newer shell", error); }
+  if (serverId !== null) await freshShellNext(serverId);
   window.location.reload();
+}
+
+async function freshShellNext(serverId: string): Promise<void> {
+  try { await requestFreshShell(caches, serverId); } catch (error) { console.warn("Ovis: the worker was not asked for a fresh shell", error); }
 }
 
 function tabMemory(): ReloadMemory | null {
@@ -73,6 +80,12 @@ interface Attempt {
   offer: RelayOffer;
   code: boolean;
   paired: boolean;
+  /** the attempt showed digits to compare: the PC took the pairing without a code */
+  compared?: boolean;
+  /** opened from a link without a code, to pair by comparing digits */
+  codeless?: boolean;
+  /** a saved key the PC refused was already dropped for this link (shellState.ts pairsAgainWithoutKey) */
+  refreshed?: boolean;
 }
 
 /** Settings' Forget this PC: the phone's key for the PC is gone; the PC lists the device until it is revoked there. */
@@ -86,8 +99,11 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
   const navigate = mount.navigate ?? ((path: string) => { window.location.assign(path); });
   const label = mount.label ?? deviceLabel(navigator.userAgent, navigator.maxTouchPoints ?? 0);
   const shellVersion = mount.shellVersion ?? __APP_VERSION__;
-  const reload = mount.reload ?? reloadPage;
   let entry = shellEntry(mount.entryUrl);
+  const reload = mount.reload ?? (() => reloadPage(entry.serverId));
+  // a part of the app the host no longer has (the kept shell is a release behind): the reload the
+  // app then offers asks the host for the shell, not the kept one
+  onLazyChunkFailure(() => { if (entry.serverId !== null) void freshShellNext(entry.serverId); });
   const scoped = entry.serverId !== null;
   const iosTab = iosBrowserTab({ userAgent: navigator.userAgent, maxTouchPoints: navigator.maxTouchPoints ?? 0, standalone: (navigator as Navigator & { standalone?: boolean }).standalone });
   let shell: Root | null = null;
@@ -98,6 +114,8 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
   /** the PC the update screen is for, while it is up */
   let outdated: { opened: RelayTransport; attempt: Attempt; name: string | null; version: string } | null = null;
   let updating = false;
+  /** the comparison on screen: its digits, and the phone's answer that they match */
+  let comparison: { name: string | null; digits: string; matched: () => void } | null = null;
 
   // the push subscription this PC's worker kept while no window could hand it over (public/sw.js
   // pushsubscriptionchange): registered with the PC once it is connected, and when the worker says
@@ -121,11 +139,20 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
   const show = (state: RelayShellState): void => {
     shell ??= createRoot(mount.container);
     shell.render(createElement(StrictMode, null, createElement(SettingsProvider, null,
-      createElement(RelayShell, { state, scoped, iosTab, onPair: pair, onRetry: retry, onCancel: cancel, onBack: toFront, onForget: forget, onUpdate: update }))));
+      createElement(RelayShell, { state, scoped, iosTab, onPair: pair, onRetry: retry, onCancel: cancel, onBack: toFront, onForget: forget, onUpdate: update, onMatch: match }))));
   };
 
   const failed = async (error: unknown, attempt: Attempt): Promise<void> => {
-    const failure = failureOf(error, { code: attempt.code, paired: attempt.paired });
+    comparison = null;
+    if (pairsAgainWithoutKey(error, { ...attempt, codeless: attempt.codeless === true })) {
+      // a Cancel or another link while the key goes ends this recovery: the newer attempt owns the screen
+      if (last !== attempt) return;
+      await store.remove(attempt.offer.server_id);
+      if (last !== attempt) return;
+      await connect({ ...attempt, refreshed: true });
+      return;
+    }
+    const failure = failureOf(error, { code: attempt.code, paired: attempt.paired, compared: attempt.compared === true, codeless: attempt.codeless === true });
     if (forgetsDevice(failure)) await store.remove(attempt.offer.server_id).catch(() => undefined);
     // the relay's close code is the one fact the sentence does not carry; a plain refusal adds nothing
     const detail = error instanceof RelayUnreachableError && error.closeCode !== null ? error.message : null;
@@ -135,6 +162,8 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
   };
 
   const connect = async (attempt: Attempt): Promise<void> => {
+    // digits shown on an earlier try say nothing about how this one fails
+    attempt.compared = false;
     last = attempt;
     opening?.abort();
     const controller = new AbortController();
@@ -144,6 +173,13 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
     try {
       opened = await open(attempt.offer, {
         store, label, signal: controller.signal,
+        // a link without a code: the digits wait on screen until this phone says they match
+        compare: (digits) => new Promise<void>((resolve) => {
+          if (controller.signal.aborted) return;
+          attempt.compared = true;
+          comparison = { name: attempt.offer.name ?? null, digits, matched: resolve };
+          show({ kind: "compare", name: comparison.name, digits, confirmed: false });
+        }),
         // the PC turned this phone away after it was in: the app goes, and the reason takes its place
         onFatal: (error) => {
           if (transport !== opened) return;
@@ -158,6 +194,7 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
       await failed(error, attempt);
       return;
     }
+    comparison = null;
     if (controller.signal.aborted) { opened.close(); return; }
     // the PC admitted this phone: a pairing code is spent, and every later attempt (Try again on
     // the update screen included) signs with the saved device key instead of pairing again
@@ -267,7 +304,7 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
 
   const pair = (): void => {
     if (entry.offer === null) return;
-    void connect({ offer: entry.offer, code: entry.offer.code !== undefined, paired: false });
+    void connect({ offer: entry.offer, code: entry.offer.code !== undefined, paired: false, codeless: entry.offer.code === undefined });
   };
 
   const retry = (): void => {
@@ -279,7 +316,15 @@ export async function mountRelayShell(mount: RelayShellMount): Promise<void> {
     void connect(last);
   };
 
+  const match = (): void => {
+    const current = comparison;
+    if (current === null) return;
+    show({ kind: "compare", name: current.name, digits: current.digits, confirmed: true });
+    current.matched();
+  };
+
   const cancel = (): void => {
+    comparison = null;
     opening?.abort();
     opening = null;
     toFront();

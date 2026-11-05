@@ -265,6 +265,7 @@ For isolated phone viewer and keyboard layout regressions (no herdr session; the
 bun scripts/file-viewer-mobile-regression.ts  # 8 viewport cases × tall/wide images
 bun scripts/keyboard-viewport-regression.ts   # keyboard, rotation and measured standalone status inset
 bun scripts/keyboard-viewport-demo-regression.ts # original real-app viewport suite on disposable demo fixtures
+bun scripts/unconfirmed-input-demo-regression.ts # typing the socket took but the server never read, then a dropped connection: held for review, not lost and not sent after the reconnect (#2587)
 bun scripts/terminal-keyboard-demo-regression.ts # the key bar's Show/Hide keyboard control: current-mode focus, measured state, composition refusal, observe/held/offline/ended; `--serve-ios` only serves the build on loopback for a Simulator
 bun scripts/droplet-demo-regression.ts        # real-app alerts below the header, keyboard and landscape
 bun scripts/chat-greeting-demo-regression.ts  # an empty chat's greeting: centred on a desktop, docked on a phone
@@ -276,7 +277,7 @@ bun scripts/diff-line-notes-demo-regression.ts # a note on a diff line (#1603): 
 bun scripts/composer-fit-demo-regression.ts   # one Send/Stop control, pending Send now actions, context/label fit and Chat font sizing
 bun scripts/plan-chip-demo-regression.ts      # the plan chip's step in progress: one row at 390 and 1440, cut when long, with tasks, the list's read states, offline and in a split, Korean too
 bun scripts/held-rows-demo-regression.ts      # held messages: the fold under an approval card, its button, a row's error
-bun scripts/chat-working-line-demo-regression.ts # the Working head: none before a working pane's first read, none under an answer drawn 300 ms or 1.5 s before the pane rests or read in with the last answer's start time or drawn while blocked, and a finished turn not reopened when the agent begins another by itself
+bun scripts/chat-working-line-demo-regression.ts # the Working head: none before a working pane's first read, none under an answer drawn 300 ms or 1.5 s before the pane rests or read in with the last answer's start time or drawn while blocked, a finished turn not reopened when the agent begins another by itself, a turn kept at work until its answer is read after herdr rests, and an empty chat's greeting kept through a /clear's short working status
 bun scripts/sidebar-activity-demo-regression.ts # Agents order Activity and pins: blocked pinned, recency, Pin agent / Unpin agent and Pin workspace / Unpin workspace from a right-click and the context-menu key, the ⋯ on a phone, and a finish opened here drawn as ready until the next one
 bun scripts/hide-pc-demo-regression.ts       # Remote PCs → Show in sidebar at 390 and 1440 on two demo PCs: a hidden PC leaves the sidebar, Agents and palette, the selection moves, the last PC stays, a reload keeps it, its link still opens, the sidebar's note shows it again
 bun scripts/sidebar-filter-demo-regression.ts # the roster's label filter on two demo PCs: fuzzy matches with their ancestors, the selection kept as context, pins and folds untouched, a live and an offline roster, the drawer and a reload clearing it; screenshots at 390 and 1440 in UI_EVIDENCE_DIR
@@ -732,6 +733,33 @@ signing secrets are unset ([app/mac/README.md](../app/mac/README.md#releases)), 
 `Ovis.exe` ([app/windows/README.md](../app/windows/README.md#releases)); the release becomes GitHub's
 latest only once it has both. A red `mac-dmg` or `windows-app` job leaves the release published: run
 **Actions → Mac app** or **Actions → Windows app** for its tag instead of releasing again.
+
+The **Desktop app** job (`.github/workflows/desktop.yml`) builds the desktop app
+([app/electron](../app/electron/README.md)) from the tag, each on its own OS and CPU, under names
+without the version, so `releases/latest/download/<name>` always gives the newest:
+`Ovis-linux-x64.deb`, `Ovis-linux-arm64.deb` (the download for Ubuntu and Debian),
+`Ovis-linux-x64.AppImage`, `Ovis-linux-arm64.AppImage`, `Ovis-mac-arm64.dmg`, `Ovis-mac-x64.dmg`, and
+`Ovis-mac-arm64.zip`, `Ovis-mac-x64.zip` (what a Mac app updates from), with their `.blockmap` files.
+The AppImage carries the static AppImage runtime (electron-builder's `toolsets.appimage`), so it
+needs no libfuse2, only the fuse3 a desktop has; without FUSE at all it runs with
+`APPIMAGE_EXTRACT_AND_RUN=1`. Its version is the tag's: the build
+stops unless `package.json` says the same. It attaches them with the update feed: `latest-linux.yml`,
+`latest-linux-arm64.yml` and one `latest-mac.yml` for both Macs (the two Mac builds' feeds merged by
+`bun app/electron/scripts/build.ts merge-feed`). The app is built to update from
+`https://github.com/devswha/ovis/releases/latest/download` (electron-updater's generic provider), so
+an installed app sees a version once it is GitHub's latest, the same moment `ovis.sh/Ovis.dmg` and
+`ovis.sh/Ovis.exe` move. Only the AppImage and the Mac app update themselves; a deb is updated by
+installing the new one.
+The Macs' files are unsigned, and a Mac app updates itself only when signed, until the repository
+variable `DESKTOP_MAC_SIGN` is `true`: then the build signs and notarizes with the same
+`MAC_*` secrets as Ovis for Mac ([app/electron](../app/electron/README.md)'s signing, with
+`OVIS_REQUIRE_NOTARIZATION=1`) and fails if one is missing or the dmg is not notarized. The `mac-dmg` and `windows-app` jobs
+wait for `desktop`, so the release becomes latest only with the desktop files in it; a red `desktop`
+job leaves the release published but holds them back: **Re-run failed jobs** on the Release run
+builds and attaches it again (`--clobber`), then runs them. **Actions → Desktop app** from `main`
+with a tag does the same for one release alone, and refuses the latest release, whose feed installed
+apps read (fix that one with a new patch release); without a tag it only builds, as on a pull
+request touching the app. A release build skips the app's unit tests, which its pull requests ran.
 Do not push release tags by hand: installed updaters read Git tags directly, so a tag is
 visible to them even without a GitHub release. Existing tags cannot be reused; fix a
 published version with a new patch release. If publishing fails after a tag was created,
@@ -1035,10 +1063,15 @@ pages or credentials.
 ### Self-hosted runner
 
 `ci.yml`'s Linux jobs of a push run on the maintainer PC's runners (labels
-`["self-hosted","self-hosted-ovis"]`) by default; other events, pull requests included, stay on
-`ubuntu-24.04`, so a pull request's timing-sensitive browser checks do not share that PC's CPU with
-the agents working there. The repository variable `CI_SELF_HOSTED_LABELS` overrides that (labels
-send same-repository pull requests back to the self-hosted runners) with another JSON array of runner labels that contains `"self-hosted"`, or with the
+`["self-hosted","self-hosted-ovis"]`) by default. A same-repository pull request goes there too
+while those runners have room for its four Linux jobs, and to `ubuntu-24.04` (with the browser
+checks sharded) when they do not, so neither pool queues while the other sits idle. The workflow
+token cannot list runners, so Detect changes counts room from the Actions API: the repository
+variable `CI_SELF_HOSTED_CAPACITY` (default 10, the PC's `self-hosted-ovis` runners) minus the
+queued and running jobs of every workflow that target those labels. When that count fails, the
+pull request stays hosted. Other events stay on `ubuntu-24.04`. The repository variable
+`CI_SELF_HOSTED_LABELS` overrides that (labels send every same-repository pull request to the
+self-hosted runners) with another JSON array of runner labels that contains `"self-hosted"`, or with the
 JSON string `"ubuntu-24.04"` to keep every job GitHub-hosted while that PC is offline. `pages.yml`
 and `release.yml` stay on `ubuntu-24.04` unless the variable holds labels. The variable routes:
 
