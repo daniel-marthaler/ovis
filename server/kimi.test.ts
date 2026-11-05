@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, openSync, closeSync, realpathSy
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { forgetTranscriptState, transcriptPage } from "./conversation.ts";
-import { kimiWireForProcesses, parseKimiTranscript } from "./kimi.ts";
+import { kimiWireForPane, parseKimiTranscript } from "./kimi.ts";
 import { processStartedAt } from "./process-start.ts";
 import { TOOL_OUTPUT_CHARS } from "./tool-output.ts";
 import { turnStarts } from "./transcript-turns.ts";
@@ -22,6 +22,9 @@ function kimiHome(...sessions: string[]): { home: string; wire: (id: string) => 
   return { home, wire, lock: (id, body) => writeFileSync(join(locks, `${id}.lock`), typeof body === "string" ? body : JSON.stringify(body)) };
 }
 /** What the CLI writes when this process takes a session. */
+let panes = 0;
+/** The binding for a fresh pane holding these processes. */
+const kimiWireForProcesses = (pids: number[], home: string) => kimiWireForPane(`w1:p${++panes}`, pids, home);
 const liveLock = (pid = process.pid) => ({ version: 1, token: `${pid}:x`, pid, hostname: hostname(), startedAt: Date.now(), clientIdentity: "kimi_code_cli" });
 
 const WIRE = [
@@ -32,7 +35,7 @@ const WIRE = [
   { type: "context.append_loop_event", agentId: "main", event: { type: "tool.call", toolCallId: "tool_1", name: "Bash", args: { command: "echo hi" }, display: { kind: "command", command: "echo hi" } }, time: 1793439032000 },
   { type: "context.append_loop_event", agentId: "main", event: { type: "tool.result", toolCallId: "tool_1", result: { output: "hi\n" } }, time: 1793439033000 },
   { type: "context.append_loop_event", agentId: "main", event: { type: "tool.call", toolCallId: "tool_2", name: "Read", args: { path: "/x" } }, time: 1793439034000 },
-  { type: "context.append_loop_event", agentId: "main", event: { type: "tool.result", toolCallId: "tool_2", result: { output: "kaputt", error: true } }, time: 1793439035000 },
+  { type: "context.append_loop_event", agentId: "main", event: { type: "tool.result", toolCallId: "tool_2", result: { output: "kaputt", isError: true } }, time: 1793439035000 },
   { type: "context.append_message", agentId: "main", message: { role: "user", content: "Und Tschau" } },
   { type: "context.append_loop_event", agentId: "main", event: { type: "content.part", part: { type: "text", text: "Tschau!" } }, time: 1793439036000 },
 ].map((record) => JSON.stringify(record)).join("\n");
@@ -112,6 +115,34 @@ it("binds the session a live lock of the pane's own process names, and follows a
   rmSync(join(home, ".kimi-code", "locks", "sessions", "session_a.lock"));
   lock("session_b", liveLock());
   expect(kimiWireForProcesses([process.pid], home)).toBe(wire("session_b"));
+});
+
+it("finds a locked session in a managed workspace's store too", () => {
+  const { home, lock } = kimiHome();
+  const path = join(home, ".kimi-code", "sessions", "wm_6f1c2d3e-0000-4000-8000-000000000000", "session_w", "agents", "main", "wire.jsonl");
+  mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, "");
+  lock("session_w", liveLock());
+  expect(kimiWireForProcesses([process.pid], home)).toBe(path);
+});
+
+it("keeps an idle Kimi's last session while the same process runs in the pane, and only then", () => {
+  const { home, wire, lock } = kimiHome("session_a", "session_b");
+  const locks = join(home, ".kimi-code", "locks", "sessions");
+  lock("session_a", liveLock());
+  expect(kimiWireForPane("w9:p1", [process.pid], home)).toBe(wire("session_a"));
+  // the CLI lets go of its lock seconds after a turn ends: the same process still shows its session
+  rmSync(join(locks, "session_a.lock"));
+  expect(kimiWireForPane("w9:p1", [process.pid], home)).toBe(wire("session_a"));
+  // a pane that never proved it shows nothing, and the process gone from the pane ends the binding
+  expect(kimiWireForPane("w9:p2", [process.pid], home)).toBeNull();
+  expect(kimiWireForPane("w9:p1", [process.pid + 1_000_000], home)).toBeNull();
+  expect(kimiWireForPane("w9:p1", [process.pid], home)).toBeNull();
+  // the same process taking another session moves the binding there
+  lock("session_a", liveLock());
+  expect(kimiWireForPane("w9:p1", [process.pid], home)).toBe(wire("session_a"));
+  rmSync(join(locks, "session_a.lock"));
+  lock("session_b", liveLock());
+  expect(kimiWireForPane("w9:p1", [process.pid], home)).toBe(wire("session_b"));
 });
 
 it("ignores a lock a crashed process left behind, another host's and a broken one", () => {

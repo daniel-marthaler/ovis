@@ -5,9 +5,9 @@
  *
  * The pane's session is proven, never guessed: a session lock the CLI wrote for one of the
  * pane's own processes (`~/.kimi-code/locks/sessions/<id>.lock`, held from the session's first
- * write until it ends), else, on Linux, the main wire log one of them holds open. With no such
- * proof, or with two sessions, the chat falls back to the terminal: no picking by creation time
- * or newest mtime, on any OS.
+ * write while it works), else, on Linux, the main wire log one of them holds open; an idle Kimi
+ * keeps the session its same process proved last. With no such proof, or with two sessions, the
+ * chat falls back to the terminal: no picking by creation time or newest mtime, on any OS.
  */
 import { closeSync, openSync, opendirSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir, hostname } from "node:os";
@@ -15,7 +15,7 @@ import { join, sep } from "node:path";
 import type { ConversationPart, ConversationTurn } from "../shared/protocol.ts";
 import type { HerdrPane } from "../shared/protocol.ts";
 import { paneProcessInfo } from "./herdr/client.ts";
-import { processAlive, processStartUpperBound } from "./process-start.ts";
+import { processAlive, processStartedAt, processStartUpperBound } from "./process-start.ts";
 import { trimOutput } from "./tool-output.ts";
 
 /** Every main wire log under `sessions` a pid holds open, by real path; empty on any read failure. */
@@ -44,19 +44,19 @@ const LOCK_BYTES = 4096;
  * but a crash leaves it behind, and its pid can come to name another process later. A lock
  * written before its pid's process started (by the latest that start can be) is that leftover.
  */
-function ownLock(path: string, own: Set<number>): boolean {
+function lockOwner(path: string, own: Set<number>): number | null {
   let lock: unknown;
   try {
-    if (statSync(path).size > LOCK_BYTES) return false;
+    if (statSync(path).size > LOCK_BYTES) return null;
     lock = JSON.parse(readFileSync(path, "utf8"));
-  } catch { return false; }
-  if (lock === null || typeof lock !== "object") return false;
+  } catch { return null; }
+  if (lock === null || typeof lock !== "object") return null;
   const { pid, hostname: host, startedAt } = lock as { pid?: unknown; hostname?: unknown; startedAt?: unknown };
-  if (typeof pid !== "number" || !own.has(pid)) return false;
-  if (typeof host === "string" && host !== "" && host !== hostname()) return false;
-  if (typeof startedAt !== "number" || !processAlive(pid)) return false;
+  if (typeof pid !== "number" || !own.has(pid)) return null;
+  if (typeof host === "string" && host !== "" && host !== hostname()) return null;
+  if (typeof startedAt !== "number" || !processAlive(pid)) return null;
   const started = processStartUpperBound(pid);
-  return started !== null && startedAt >= started;
+  return started !== null && startedAt >= started ? pid : null;
 }
 
 /** The main agent's wire log of the session with this id, in whichever folder's store holds it. */
@@ -64,36 +64,74 @@ function wireOfSession(sessionId: string, sessions: string): string | null {
   let stores: string[];
   try { stores = readdirSync(sessions); } catch { return null; }
   for (const store of stores) {
-    if (!store.startsWith("wd_")) continue;
+    // a folder's sessions (wd_) and managed workspaces' (wm_)
+    if (!store.startsWith("wd_") && !store.startsWith("wm_")) continue;
     const path = join(sessions, store, sessionId, "agents", "main", "wire.jsonl");
     try { if (statSync(path).isFile()) return path; } catch { /* not in this store */ }
   }
   return null;
 }
 
+/** What the processes prove: one session's log and the process that holds it, none, or two sessions. */
+type Proof = { path: string; pid: number } | "none" | "ambiguous";
+
 /**
- * The wire log these processes (a pane's shell and foreground processes) own: the session a live
- * lock of theirs names, else on Linux the main log they hold open, which a session has before its
- * lock. Two sessions are no answer, and neither is none.
+ * The session these processes (a pane's shell and foreground processes) own right now: the one a
+ * live lock of theirs names, else on Linux the main log they hold open, which a session has before
+ * its lock.
  */
-export function kimiWireForProcesses(pids: number[], home = homedir()): string | null {
-  const own = new Set(pids.filter((pid) => Number.isSafeInteger(pid) && pid > 1));
+function proveWire(own: Set<number>, home: string): Proof {
   const sessions = join(home, ".kimi-code", "sessions");
   const locks = join(home, ".kimi-code", "locks", "sessions");
   let names: string[] = [];
   try { names = readdirSync(locks); } catch { /* no session holds a lock */ }
-  const locked = new Set<string>();
+  const locked = new Map<string, number>();
   for (const name of names) {
     if (!name.endsWith(".lock")) continue;
-    if (ownLock(join(locks, name), own)) locked.add(name.slice(0, -".lock".length));
+    const pid = lockOwner(join(locks, name), own);
+    if (pid !== null) locked.set(name.slice(0, -".lock".length), pid);
   }
-  if (locked.size > 1) return null;
-  if (locked.size === 1) return wireOfSession([...locked][0]!, sessions);
-  if (process.platform !== "linux") return null;
+  if (locked.size > 1) return "ambiguous";
+  if (locked.size === 1) {
+    const [sessionId, pid] = [...locked][0]!;
+    const path = wireOfSession(sessionId, sessions);
+    return path === null ? "none" : { path, pid };
+  }
+  if (process.platform !== "linux") return "none";
   let root: string;
-  try { root = realpathSync(sessions); } catch { return null; }
-  const held = new Set([...own].flatMap((pid) => wireLogsHeld(pid, root)));
-  return held.size === 1 ? [...held][0]! : null;
+  try { root = realpathSync(sessions); } catch { return "none"; }
+  const held = new Map<string, number>();
+  for (const pid of own) for (const path of wireLogsHeld(pid, root)) held.set(path, pid);
+  if (held.size > 1) return "ambiguous";
+  const [first] = [...held];
+  return first === undefined ? "none" : { path: first[0], pid: first[1] };
+}
+
+/**
+ * The last session proven for each pane, and the process that held it. The CLI lets go of its lock
+ * a few seconds after a turn ends and opens its log only to append, so an idle Kimi proves nothing;
+ * while that same process (same pid and start) still runs in the pane and holds no other session,
+ * its last session is still the one it shows.
+ */
+const proven = new Map<string, { path: string; pid: number; started: number }>();
+
+/**
+ * The wire log these processes own: the session they prove now, else the one the same live process
+ * proved last for this pane. Two sessions are no answer, and neither is none.
+ */
+export function kimiWireForPane(paneId: string, pids: number[], home = homedir()): string | null {
+  const own = new Set(pids.filter((pid) => Number.isSafeInteger(pid) && pid > 1));
+  const proof = proveWire(own, home);
+  if (typeof proof === "object") {
+    const started = processStartedAt(proof.pid);
+    if (started === null) proven.delete(paneId);
+    else proven.set(paneId, { ...proof, started });
+    return proof.path;
+  }
+  const last = proven.get(paneId);
+  if (proof === "none" && last !== undefined && own.has(last.pid) && processAlive(last.pid) && processStartedAt(last.pid) === last.started) return last.path;
+  proven.delete(paneId);
+  return null;
 }
 
 /** The wire log of the Kimi session the pane's own processes hold, or null: the chat then stays on the terminal. */
@@ -101,7 +139,7 @@ export async function kimiTranscriptPathForPane(pane: HerdrPane, home = homedir(
   const info = await paneProcessInfo(pane.pane_id).catch(() => null);
   if (!info) return null;
   const pids = [info.shell_pid, ...(info.foreground_processes ?? []).map((process) => process.pid)];
-  return kimiWireForProcesses(pids.filter((pid): pid is number => typeof pid === "number"), home);
+  return kimiWireForPane(pane.pane_id, pids.filter((pid): pid is number => typeof pid === "number"), home);
 }
 
 /** The text of a user message: Kimi stores content as parts, older ones as a plain string. */
@@ -174,7 +212,7 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
       event?: {
         type?: unknown; part?: { type?: unknown; text?: unknown; think?: unknown };
         toolCallId?: unknown; name?: unknown; args?: unknown; display?: { kind?: unknown; command?: unknown };
-        result?: { output?: unknown; error?: unknown };
+        result?: { output?: unknown; isError?: unknown; error?: unknown };
       };
     } | null;
     try { record = JSON.parse(line) as typeof record; } catch { continue; }
@@ -212,7 +250,7 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
       if (tool === undefined) continue;
       const output = event.result?.output;
       trimOutput(tool, typeof output === "string" ? output : JSON.stringify(output ?? ""), event.toolCallId as string);
-      tool.state = event.result?.error ? "error" : "ok";
+      tool.state = event.result?.isError === true || event.result?.error ? "error" : "ok";
       if (tool.state === "error") tool.error = true;
       pending.delete(event.toolCallId as string);
     }
