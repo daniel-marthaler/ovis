@@ -137,6 +137,13 @@ it("keeps an idle Kimi's last session while the same process runs in the pane, a
   expect(kimiWireForPane("w9:p2", [process.pid], home)).toBeNull();
   expect(kimiWireForPane("w9:p1", [process.pid + 1_000_000], home)).toBeNull();
   expect(kimiWireForPane("w9:p1", [process.pid], home)).toBeNull();
+  // another process locking that session takes it away
+  lock("session_a", liveLock());
+  expect(kimiWireForPane("w9:p3", [process.pid], home)).toBe(wire("session_a"));
+  rmSync(join(locks, "session_a.lock"));
+  lock("session_a", { ...liveLock(), pid: process.ppid });
+  expect(kimiWireForPane("w9:p3", [process.pid], home)).toBeNull();
+  rmSync(join(locks, "session_a.lock"));
   // the same process taking another session moves the binding there
   lock("session_a", liveLock());
   expect(kimiWireForPane("w9:p1", [process.pid], home)).toBe(wire("session_a"));

@@ -11,7 +11,7 @@
  */
 import { closeSync, openSync, opendirSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { join, sep } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import type { ConversationPart, ConversationTurn } from "../shared/protocol.ts";
 import type { HerdrPane } from "../shared/protocol.ts";
 import { paneProcessInfo } from "./herdr/client.ts";
@@ -107,31 +107,43 @@ function proveWire(own: Set<number>, home: string): Proof {
   return first === undefined ? "none" : { path: first[0], pid: first[1] };
 }
 
-/**
- * The last session proven for each pane, and the process that held it. The CLI lets go of its lock
- * a few seconds after a turn ends and opens its log only to append, so an idle Kimi proves nothing;
- * while that same process (same pid and start) still runs in the pane and holds no other session,
- * its last session is still the one it shows.
- */
-const proven = new Map<string, { path: string; pid: number; started: number }>();
+/** What names a running program: its start, and on Linux its command line, which an exec replaces. */
+function programOf(pid: number): string | null {
+  const started = processStartedAt(pid);
+  if (started === null) return null;
+  if (process.platform !== "linux") return String(started);
+  try { return `${started}\0${readFileSync(`/proc/${pid}/cmdline`, "utf8")}`; } catch { return null; }
+}
 
 /**
- * The wire log these processes own: the session they prove now, else the one the same live process
+ * The last session proven for each pane, and the program that held it. The CLI lets go of its lock
+ * a few seconds after a turn ends and opens its log only to append, so an idle Kimi proves nothing;
+ * while that same program still runs in the pane, holds no other session and no other process has
+ * locked this one, its last session is still the one it shows.
+ */
+const proven = new Map<string, { path: string; pid: number; program: string }>();
+
+/**
+ * The wire log these processes own: the session they prove now, else the one the same live program
  * proved last for this pane. Two sessions are no answer, and neither is none.
  */
 export function kimiWireForPane(paneId: string, pids: number[], home = homedir()): string | null {
   const own = new Set(pids.filter((pid) => Number.isSafeInteger(pid) && pid > 1));
   const proof = proveWire(own, home);
   if (typeof proof === "object") {
-    const started = processStartedAt(proof.pid);
-    if (started === null) proven.delete(paneId);
-    else proven.set(paneId, { ...proof, started });
+    const program = programOf(proof.pid);
+    if (program === null) proven.delete(paneId);
+    else proven.set(paneId, { ...proof, program });
     return proof.path;
   }
   const last = proven.get(paneId);
-  if (proof === "none" && last !== undefined && own.has(last.pid) && processAlive(last.pid) && processStartedAt(last.pid) === last.started) return last.path;
   proven.delete(paneId);
-  return null;
+  if (proof !== "none" || last === undefined || !own.has(last.pid) || !processAlive(last.pid) || programOf(last.pid) !== last.program) return null;
+  // a lock on this session now is another process's (the pane's own would have proved it)
+  const sessionId = basename(dirname(dirname(dirname(last.path))));
+  try { statSync(join(home, ".kimi-code", "locks", "sessions", `${sessionId}.lock`)); return null; } catch { /* nobody holds it */ }
+  proven.set(paneId, last);
+  return last.path;
 }
 
 /** The wire log of the Kimi session the pane's own processes hold, or null: the chat then stays on the terminal. */
