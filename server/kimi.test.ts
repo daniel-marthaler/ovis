@@ -4,6 +4,7 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { forgetTranscriptState, transcriptPage } from "./conversation.ts";
 import { kimiWireForProcesses, parseKimiTranscript } from "./kimi.ts";
+import { processStartedAt } from "./process-start.ts";
 import { TOOL_OUTPUT_CHARS } from "./tool-output.ts";
 import { turnStarts } from "./transcript-turns.ts";
 
@@ -120,6 +121,14 @@ it("ignores a lock a crashed process left behind, another host's and a broken on
   lock("session_far", { ...liveLock(), hostname: `${hostname()}-elsewhere` });
   lock("session_null", "null");
   lock("session_junk", "{");
+  expect(kimiWireForProcesses([process.pid], home)).toBeNull();
+});
+
+it.skipIf(process.platform !== "linux" && process.platform !== "darwin")("ignores a lock dated where its process may not have started yet", () => {
+  const { home, lock } = kimiHome("session_old");
+  // the earliest the process may have started (Linux's btime is whole seconds): a lock a dead
+  // process wrote then could be one its reused pid never wrote
+  lock("session_old", { ...liveLock(), startedAt: processStartedAt(process.pid)! });
   expect(kimiWireForProcesses([process.pid], home)).toBeNull();
 });
 

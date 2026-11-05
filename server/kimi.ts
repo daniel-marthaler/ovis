@@ -15,7 +15,7 @@ import { join, sep } from "node:path";
 import type { ConversationPart, ConversationTurn } from "../shared/protocol.ts";
 import type { HerdrPane } from "../shared/protocol.ts";
 import { paneProcessInfo } from "./herdr/client.ts";
-import { processAlive, processStartedAt } from "./process-start.ts";
+import { processAlive, processStartUpperBound } from "./process-start.ts";
 import { trimOutput } from "./tool-output.ts";
 
 /** Every main wire log under `sessions` a pid holds open, by real path; empty on any read failure. */
@@ -35,22 +35,28 @@ function wireLogsHeld(pid: number, sessions: string): string[] {
   return held;
 }
 
+/** A lock is a small JSON object; anything larger is not the CLI's. */
+const LOCK_BYTES = 4096;
+
 /**
- * The session a lock file names when this very process wrote it: the CLI writes
+ * Whether one of `own` wrote this lock and still holds it: the CLI writes
  * `{ pid, hostname, startedAt }` when it takes the session and removes the file when it lets go,
  * but a crash leaves it behind, and its pid can come to name another process later. A lock
- * written before its pid's process started is that leftover.
+ * written before its pid's process started (by the latest that start can be) is that leftover.
  */
-function lockOwner(path: string): number | null {
+function ownLock(path: string, own: Set<number>): boolean {
   let lock: unknown;
-  try { lock = JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
-  if (lock === null || typeof lock !== "object") return null;
+  try {
+    if (statSync(path).size > LOCK_BYTES) return false;
+    lock = JSON.parse(readFileSync(path, "utf8"));
+  } catch { return false; }
+  if (lock === null || typeof lock !== "object") return false;
   const { pid, hostname: host, startedAt } = lock as { pid?: unknown; hostname?: unknown; startedAt?: unknown };
-  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 1) return null;
-  if (typeof host === "string" && host !== "" && host !== hostname()) return null;
-  if (typeof startedAt !== "number" || !processAlive(pid)) return null;
-  const started = processStartedAt(pid);
-  return started !== null && startedAt >= started ? pid : null;
+  if (typeof pid !== "number" || !own.has(pid)) return false;
+  if (typeof host === "string" && host !== "" && host !== hostname()) return false;
+  if (typeof startedAt !== "number" || !processAlive(pid)) return false;
+  const started = processStartUpperBound(pid);
+  return started !== null && startedAt >= started;
 }
 
 /** The main agent's wire log of the session with this id, in whichever folder's store holds it. */
@@ -79,8 +85,7 @@ export function kimiWireForProcesses(pids: number[], home = homedir()): string |
   const locked = new Set<string>();
   for (const name of names) {
     if (!name.endsWith(".lock")) continue;
-    const pid = lockOwner(join(locks, name));
-    if (pid !== null && own.has(pid)) locked.add(name.slice(0, -".lock".length));
+    if (ownLock(join(locks, name), own)) locked.add(name.slice(0, -".lock".length));
   }
   if (locked.size > 1) return null;
   if (locked.size === 1) return wireOfSession([...locked][0]!, sessions);
@@ -216,41 +221,58 @@ export function parseKimiTranscript(text: string): ConversationTurn[] {
   return turns;
 }
 
+/** A result record longer than this is not read back whole. */
+const RECORD_BYTES = 64 * 1024 * 1024;
+
 /**
  * The whole output of one tool call, by Kimi's toolCallId, cut at `max`: the log is searched in
- * chunks for the id's bytes, and only a line that holds them is decoded and parsed.
+ * chunks for the id's bytes, and only a line that holds them is read back and parsed.
  */
 export function kimiToolOutput(path: string, ref: string, max: number): string | null {
   const id = Buffer.from(JSON.stringify(ref));
-  /** The result in the whole lines of `bytes` before `end`, or undefined. */
-  const find = (bytes: Buffer, end: number): string | undefined => {
-    for (let at = bytes.indexOf(id); at !== -1 && at < end; at = bytes.indexOf(id, at + id.length)) {
-      const stop = Math.min(end, bytes.indexOf(0x0a, at) === -1 ? end : bytes.indexOf(0x0a, at));
-      let record: { type?: unknown; event?: { type?: unknown; toolCallId?: unknown; result?: { output?: unknown } } } | null;
-      try { record = JSON.parse(bytes.subarray(bytes.lastIndexOf(0x0a, at) + 1, stop).toString("utf8")); } catch { at = stop; continue; }
-      const event = record?.event;
-      if (record?.type === "context.append_loop_event" && event?.type === "tool.result" && event.toolCallId === ref) {
-        const output = event.result?.output;
-        const text = typeof output === "string" ? output : JSON.stringify(output ?? "");
-        return text.length > max ? `${text.slice(0, max)}\n… trimmed` : text;
-      }
-      at = stop;
-    }
-    return undefined;
-  };
   let fd: number;
   try { fd = openSync(path, "r"); } catch { return null; }
+  /** The output if the line at [start, end) is this call's result. */
+  const result = (start: number, end: number): string | undefined => {
+    if (end - start > RECORD_BYTES) return undefined;
+    const bytes = Buffer.alloc(end - start);
+    if (readSync(fd, bytes, 0, bytes.length, start) !== bytes.length) return undefined;
+    let record: { type?: unknown; event?: { type?: unknown; toolCallId?: unknown; result?: { output?: unknown } } } | null;
+    try { record = JSON.parse(bytes.toString("utf8")); } catch { return undefined; }
+    const event = record?.event;
+    if (record?.type !== "context.append_loop_event" || event?.type !== "tool.result" || event.toolCallId !== ref) return undefined;
+    const output = event.result?.output;
+    const text = typeof output === "string" ? output : JSON.stringify(output ?? "");
+    return text.length > max ? `${text.slice(0, max)}\n… trimmed` : text;
+  };
   try {
     const chunk = Buffer.alloc(1024 * 1024);
-    let carry = Buffer.alloc(0);
-    for (let position = 0, got = 0; (got = readSync(fd, chunk, 0, chunk.length, position)) > 0; position += got) {
-      const bytes = carry.length === 0 ? chunk.subarray(0, got) : Buffer.concat([carry, chunk.subarray(0, got)]);
-      const end = bytes.lastIndexOf(0x0a) + 1;
-      const found = find(bytes, end);
-      if (found !== undefined) return found;
-      carry = Buffer.from(bytes.subarray(end));
+    // where the current line starts, whether it holds the id, and its last bytes before this chunk (an id cut in two)
+    let lineStart = 0;
+    let hit = false;
+    let tail = Buffer.alloc(0);
+    let position = 0;
+    for (let got = 0; (got = readSync(fd, chunk, 0, chunk.length, position)) > 0; position += got) {
+      const bytes = chunk.subarray(0, got);
+      for (let from = 0; ;) {
+        const newline = bytes.indexOf(0x0a, from);
+        const end = newline === -1 ? got : newline;
+        if (!hit) hit = (from === 0 && tail.length > 0 ? Buffer.concat([tail, bytes.subarray(0, end)]) : bytes.subarray(from, end)).includes(id);
+        if (newline === -1) {
+          tail = Buffer.from(bytes.subarray(Math.max(from, got - id.length + 1), got));
+          break;
+        }
+        if (hit) {
+          const found = result(lineStart, position + newline);
+          if (found !== undefined) return found;
+        }
+        lineStart = position + newline + 1;
+        hit = false;
+        tail = Buffer.alloc(0);
+        from = newline + 1;
+      }
     }
     // the last record, whole when it parses, may not end in a newline yet
-    return find(carry, carry.length) ?? null;
+    return (hit ? result(lineStart, position) : undefined) ?? null;
   } catch { return null; } finally { closeSync(fd); }
 }
